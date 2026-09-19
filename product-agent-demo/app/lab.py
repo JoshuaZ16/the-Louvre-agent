@@ -115,33 +115,50 @@ def sources_from(records):
         if not http_url(url) or url in seen: continue
         seen.add(url)
         host = urlparse(url).hostname or ""
+        source_level = str(r.get("source_level") or r.get("kind") or "").lower()
+        trusted = bool(r.get("is_official")) or host.endswith(".gov.cn") or host.endswith(".nifdc.org.cn") or source_level in {"official", "registration", "authority", "官方来源", "监管公开来源"}
         sources.append({"source_id": f"s{len(sources)+1}", "title": r.get("title") or host,
             "url": url, "domain": host, "snippet": str(r.get("snippet") or r.get("content") or "")[:2500],
-            "kind": "监管公开来源" if host.endswith(".gov.cn") or host.endswith(".nifdc.org.cn") else "待核实来源"})
+            "kind": "监管公开来源" if trusted else "待核验来源", "trusted": trusted})
     return sources[:12]
 
 def validate_report(report, sources):
+    if not isinstance(report, dict):
+        raise ValueError("模型报告必须是 JSON 对象")
     allowed = {s["source_id"] for s in sources}
+    trusted = {s["source_id"] for s in sources if s.get("trusted")}
     facts, audits = [], []
-    gaps = report.get("evidence_gaps", [])
-    gaps = gaps if isinstance(gaps, list) else []
-    for f in report.get("official_facts", [])[:5]:
+    status_values = {"有资料支持", "部分支持", "待核验", "存在冲突"}
+    def text(value, limit):
+        return str(value or "").strip()[:limit]
+
+    def list_of_text(value, limit):
+        result = []
+        for item in value if isinstance(value, list) else []:
+            raw = item.get("text") or item.get("observation") if isinstance(item, dict) else item
+            if text(raw, limit): result.append(text(raw, limit))
+        return result
+
+    gaps = list_of_text(report.get("evidence_gaps"), 240)
+    for f in (report.get("official_facts") if isinstance(report.get("official_facts"), list) else [])[:5]:
         if not isinstance(f, dict): continue
-        ids = [i for i in f.get("source_ids", []) if i in allowed]
-        if ids: facts.append({**f, "source_ids": ids})
-        else: gaps.append("一条模型事实缺少可追溯来源，已移出事实卡")
-    for a in report.get("claim_evidence_audit", [])[:8]:
+        ids = [str(i) for i in (f.get("source_ids") if isinstance(f.get("source_ids"), list) else []) if str(i) in allowed and str(i) in trusted]
+        fact = text(f.get("fact"), 300)
+        if ids and fact: facts.append({"fact": fact, "source_ids": ids})
+        else: gaps.append("一条模型事实缺少监管公开来源，已移出事实卡")
+    for a in (report.get("claim_evidence_audit") if isinstance(report.get("claim_evidence_audit"), list) else [])[:8]:
         if not isinstance(a, dict): continue
-        ids = [i for i in a.get("source_ids", []) if i in allowed]
-        audits.append({**a, "source_ids": ids, "status": a.get("status", "待核验") if ids else "待核验"})
-    raw_claims = report.get("claims", [])
-    claims = raw_claims[:8] if isinstance(raw_claims, list) else []
-    observations = report.get("image_observations", [])
-    observations = observations[:8] if isinstance(observations, list) else []
-    return {"report_type": "official_source_report", "product_identity": report.get("product_identity", {}),
-        "summary": str(report.get("summary", ""))[:500], "claims": claims,
+        ids = [str(i) for i in (a.get("source_ids") if isinstance(a.get("source_ids"), list) else []) if str(i) in allowed]
+        candidate_status = a.get("status")
+        status = candidate_status if isinstance(candidate_status, str) and candidate_status in status_values else "待核验"
+        claim, reason = text(a.get("claim"), 300), text(a.get("reason"), 500)
+        if claim: audits.append({"claim": claim, "reason": reason, "source_ids": ids, "status": status if any(i in trusted for i in ids) else "待核验"})
+    raw_identity = report.get("product_identity") if isinstance(report.get("product_identity"), dict) else {}
+    identity = {key: text(raw_identity.get(key), limit) for key, limit in (("brand", 80), ("product_name", 120), ("specification", 80))}
+    return {"report_type": "official_source_report", "product_identity": identity,
+        "summary": text(report.get("summary"), 500), "claims": list_of_text(report.get("claims"), 240)[:8],
         "official_facts": facts, "claim_evidence_audit": audits, "evidence_gaps": gaps[:6],
-        "image_observations": observations,
+        "image_observations": list_of_text(report.get("image_observations"), 240)[:8],
         "sources": sources, "evidence_basis": "联网检索返回材料，点击来源查看原文"}
 
 class McpInput(BaseModel):
@@ -318,8 +335,8 @@ async def run_models(options, image):
                 if identity.get("batch_detected"):
                     await put("needs_input",message="这一张图片包含多条独立种草文案。请把每条文案分别上传，工作台会并行批量处理")
                     return
-                if float(identity.get("confidence",0))<.70 and not query:
-                    await put("needs_input",message="请补充产品名称或清晰包装图")
+                if float(identity.get("confidence",0))<.70:
+                    await put("needs_input",message="识别置信度不足，请补充清晰包装图后再检索")
                     return
                 query=f"{identity.get('brand','')} {identity.get('product_name','')} {query}"
             if not query: raise ValueError("请输入产品名称或上传图片")

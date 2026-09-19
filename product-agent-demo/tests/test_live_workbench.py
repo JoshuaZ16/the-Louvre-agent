@@ -3,7 +3,7 @@ import json
 import unittest
 from unittest.mock import patch
 import httpx
-from app.lab import normalize_identity, parse_json, retrieve, run_models, validate_report
+from app.lab import normalize_identity, parse_json, retrieve, run_models, sources_from, validate_report
 
 class WorkbenchLiveTests(unittest.TestCase):
     def test_identity_classifier_keeps_one_post_small_and_marks_collage_for_separate_batch_items(self):
@@ -30,6 +30,32 @@ class WorkbenchLiveTests(unittest.TestCase):
         self.assertLessEqual(len(report['claim_evidence_audit']),8)
         self.assertLessEqual(len(report['evidence_gaps']),6)
         self.assertLessEqual(len(report['image_observations']),8)
+
+    def test_report_validation_rejects_untrusted_sources_as_official_facts(self):
+        report = validate_report({
+            'summary': 'summary',
+            'official_facts': [{'fact': '营销页面说法', 'source_ids': ['s1']}],
+            'claim_evidence_audit': [{'claim': '用户说法', 'status': '有资料支持', 'source_ids': ['s1']}],
+            'evidence_gaps': [],
+        }, [{'source_id': 's1', 'url': 'https://brand.example/product', 'trusted': False}])
+        self.assertEqual(report['official_facts'], [])
+        self.assertTrue(any('监管公开来源' in gap for gap in report['evidence_gaps']))
+        self.assertEqual(report['claim_evidence_audit'][0]['status'], '待核验')
+
+    def test_report_validation_downgrades_malformed_status(self):
+        report = validate_report({
+            'summary': 'summary',
+            'official_facts': [],
+            'claim_evidence_audit': [{'claim': 'x', 'status': [], 'source_ids': []}],
+            'evidence_gaps': [],
+        }, [])
+        self.assertEqual(report['claim_evidence_audit'][0]['status'], '待核验')
+
+    def test_explicit_official_source_metadata_is_preserved(self):
+        sources = sources_from([{'url': 'https://brand.example/product', 'title': '官方产品页', 'source_level': 'official'}])
+        report = validate_report({'official_facts': [{'fact': '官方事实', 'source_ids': ['s1']}], 'claim_evidence_audit': []}, sources)
+        self.assertTrue(sources[0]['trusted'])
+        self.assertEqual(report['official_facts'][0]['source_ids'], ['s1'])
 
     def test_report_json_accepts_one_fenced_object_after_explanation(self):
         text='报告如下。来源为空，因此全部待核验。\n```json\n{"summary":"实际模型报告","claims":[]}\n```'
@@ -122,7 +148,7 @@ class WorkbenchLiveTests(unittest.TestCase):
             return httpx.Response(200,json={'choices':[{'message':{'content':json.dumps({'brand':'Test','product_name':'Cream','confidence':.92})}}]})
         real=httpx.AsyncClient
         def client(**kwargs):return real(transport=httpx.MockTransport(handler),**kwargs)
-        async def search(*args,**kwargs):return ([{'source_id':'s1','url':'https://brand.example/product','title':'Product'}],'Source text')
+        async def search(*args,**kwargs):return ([{'source_id':'s1','url':'https://www.nifdc.org.cn/product','title':'Product','trusted':True}],'Source text')
         async def collect():
             return [json.loads(s.removeprefix('data: ')) async for s in run_models({'models':[{'id':'report','base_url':'https://model.example/v1','api_key':'x','model':'report-model'}],'vision_model':'vision-model','search_enabled':True},'data:image/png;base64,a')]
         with patch('app.lab.httpx.AsyncClient',side_effect=client),patch('app.lab.retrieve',side_effect=search):events=asyncio.run(collect())

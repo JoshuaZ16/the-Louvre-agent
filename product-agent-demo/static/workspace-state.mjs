@@ -8,7 +8,7 @@ export const agentDefinitions={
  visual:{name:'图片核查 Agent',icon:'image',description:'检查包装文字与可见图片信息'}
 };
 export function emptyRun(){return {identity:null,input_type:'',batch_detected:false,sources:[],report:null,reports:{},agents:Object.fromEntries(Object.keys(agentDefinitions).map(id=>[id,{status:'idle',message:'等待共享识别与检索材料',draft:'',report:null}])),draft:'',error:'',elapsed:0,stages:{identify:{status:'idle',message:'等待图片识别'},search:{status:'idle',message:'识别产品后检索相关资料'},report:{status:'idle',message:'三个 Agent 等待共享材料'}}};}
-export function batchProgress(items){const runs=items.map(item=>item?.run||emptyRun());const finished=runs.filter(r=>['done','error','attention','cancelled'].includes(r.stages.report.status)||r.error).length;const successful=runs.filter(r=>r.report||r.stages.report.status==='done').length;return {total:runs.length,finished,successful,failed:Math.max(0,finished-successful)};}
+export function batchProgress(items){const runs=items.map(item=>item?.run||emptyRun());const partialFailure=r=>!!r.error||Object.values(r.agents||{}).some(a=>a.status==='error');const finished=runs.filter(r=>['done','error','attention','cancelled'].includes(r.stages.report.status)||partialFailure(r)).length;const successful=runs.filter(r=>r.report&&r.stages.report.status==='done'&&!partialFailure(r)).length;return {total:runs.length,finished,successful,failed:Math.max(0,finished-successful)};}
 export function reduceRun(previous,event){
  const r={...previous,reports:{...previous.reports},agents:structuredClone(previous.agents),stages:structuredClone(previous.stages)};
  const set=(k,status,message)=>r.stages[k]={status,message},id=event.model_id||'report';

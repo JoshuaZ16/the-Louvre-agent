@@ -1,6 +1,6 @@
 # 百炼产品识别 Agent Demo
 
-这是一个真实 API 接入的本地 Host Demo：上传一张或多张产品/社交媒体截图后，调用百炼兼容接口识别产品，再通过配置好的检索服务做资料检索，并在画布中并行展示三个 Agent 的可审计进度。代码不生成 mock 识别结果或假来源；缺少密钥会直接显示配置错误。
+这是一个真实 API 接入的本地 Host Demo：上传一张或多张产品/社交媒体截图后，调用百炼兼容接口识别产品，再通过配置好的检索服务做资料检索，并在画布中展示三个 Agent 的可审计进度。批量最多保留 8 张图片，同时最多运行 3 张，避免一次性打满上游。代码不生成 mock 识别结果或假来源；缺少密钥会直接显示配置错误。
 
 ## 运行
 
@@ -27,6 +27,13 @@ uvicorn app.main:app --reload --port 8000
 - `static/lab.html` + `static/product-workbench.js`：画布、图片素材列表、配置抽屉、批量进度和结果导出。
 - `tests/`：模型输出边界、流式检索、批量状态和 HTTP 入口测试。
 
+运行测试（在 `product-agent-demo` 目录内）：
+
+```bash
+python -m unittest discover -s tests
+node --test tests/workspace-state.test.mjs
+```
+
 ## 当前边界
 
-MCP 工具名称和入参由百炼控制台实际开通的服务决定，因此通过页面配置或环境变量提供；没有配置检索服务时页面会保留识别结果并明确显示证据缺口，不会生成虚假的证据。社交媒体截图会被标记为 UGC，文案中的功效和参数只作为待核验声明。后续接入产品登记、成分库、淘宝/天猫评论时，为每个来源实现一个 `EvidenceProvider`，返回统一的 `EvidenceItem`，报告只读取结构化证据。下一阶段安排见 [`design/optimization-roadmap.md`](design/optimization-roadmap.md)。
+MCP 工具名称和入参由百炼控制台实际开通的服务决定，因此通过页面配置或环境变量提供；没有配置检索服务时页面会保留识别结果并明确显示证据缺口，不会生成虚假的证据。社交媒体截图会被标记为 UGC，文案中的功效和参数只作为待核验声明。官方事实只接受监管来源或检索提供方明确标记为 `official`、`registration`、`authority` 的来源；没有可信等级的普通网页仍会保留为可点击的待核验来源。后续接入产品登记、成分库、淘宝/天猫评论时，为每个来源实现一个 `EvidenceProvider`，返回统一的 `EvidenceItem`，报告只读取结构化证据。下一阶段安排见 [`design/optimization-roadmap.md`](design/optimization-roadmap.md)。
