@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>产品信任守护 Agent</title>
+  <link rel="icon" href="data:," />
+  <style>
+    :root { color-scheme: dark; font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif; }
+    body { margin: 0; background: #101216; color: #eef0f4; }
+    main { max-width: 1280px; margin: 0 auto; padding: 32px; }
+    h1 { margin: 0 0 8px; font-size: 30px; }
+    .sub { color: #9da5b4; margin-bottom: 24px; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr 1.2fr; gap: 16px; }
+    section { background: #191d24; border: 1px solid #2c3340; border-radius: 14px; padding: 18px; min-height: 480px; }
+    .label { color: #9da5b4; font-size: 13px; text-transform: uppercase; letter-spacing: .08em; }
+    #preview { width: 100%; max-height: 330px; object-fit: contain; margin-top: 16px; border-radius: 10px; background: #0d0f13; }
+    button { margin-top: 16px; padding: 11px 18px; border: 0; border-radius: 8px; background: #d6ff5f; color: #101216; font-weight: 700; cursor: pointer; }
+    button:disabled { opacity: .5; cursor: wait; }
+    #events { display: flex; flex-direction: column; gap: 10px; margin-top: 14px; }
+    .event { padding: 10px 12px; border-left: 3px solid #798397; background: #11141a; border-radius: 5px; }
+    .event strong { display: block; color: #d6ff5f; margin-bottom: 4px; }
+    pre { white-space: pre-wrap; font-size: 13px; color: #d9dee7; }
+    .warn { color: #ffb4a5; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>产品信任守护 Agent</h1>
+  <div class="sub">真实百炼视觉识别 → 产品证据检索 → 可审计报告</div>
+  <div class="grid">
+    <section>
+      <div class="label">01 / 上传产品截图</div>
+      <input id="file" type="file" accept="image/*" />
+      <img id="preview" alt="待识别图片预览" />
+      <button id="run">开始真实识别</button>
+      <p id="status" class="sub"></p>
+    </section>
+    <section>
+      <div class="label">02 / Agent 可审计步骤</div>
+      <div id="events"><div class="sub">等待上传图片</div></div>
+    </section>
+    <section>
+      <div class="label">03 / 产品与证据汇总</div>
+      <pre id="report">识别完成后显示结构化结果。</pre>
+    </section>
+  </div>
+</main>
+<script>
+const file = document.querySelector('#file');
+const preview = document.querySelector('#preview');
+const run = document.querySelector('#run');
+const events = document.querySelector('#events');
+const report = document.querySelector('#report');
+const status = document.querySelector('#status');
+file.addEventListener('change', () => {
+  const selected = file.files[0];
+  if (selected) preview.src = URL.createObjectURL(selected);
+});
+run.addEventListener('click', async () => {
+  const selected = file.files[0];
+  if (!selected) { status.textContent = '请先选择产品图片'; return; }
+  run.disabled = true; events.innerHTML = ''; report.textContent = ''; status.textContent = '正在调用百炼，请稍候…';
+  const body = new FormData(); body.append('upload', selected);
+  let hadError = false;
+  try {
+    const response = await fetch('/api/analyze/stream', { method: 'POST', body });
+    if (!response.ok) throw new Error(await response.text());
+    const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = '';
+    while (true) {
+      const { value, done } = await reader.read(); if (done) break;
+      buffer += decoder.decode(value, {stream: true });
+      const chunks = buffer.split('\n\n'); buffer = chunks.pop();
+      for (const chunk of chunks) {
+        const line = chunk.split('\n').find(x => x.startsWith('data: ')); if (!line) continue;
+        const event = JSON.parse(line.slice(6));
+        const node = document.createElement('div'); node.className = 'event';
+        const title = document.createElement('strong'); title.textContent = event.type;
+        const message = document.createElement('span'); message.textContent = event.message;
+        node.append(title, message);
+        events.appendChild(node);
+        if (event.type === 'report_ready') report.textContent = JSON.stringify(event.data.report, null, 2);
+        if (event.type === 'error') { hadError = true; node.classList.add('warn'); status.textContent = event.message; }
+      }
+    }
+    if (!hadError) status.textContent = '处理完成';
+  } catch (error) { status.textContent = '请求失败：' + error.message; }
+  finally { run.disabled = false; }
+});
+</script>
+</body>
+</html>
