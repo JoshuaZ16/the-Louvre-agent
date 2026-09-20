@@ -149,8 +149,8 @@ class WorkbenchLiveTests(unittest.TestCase):
                 if body['model']=='vision-model':
                     return httpx.Response(200,json={'choices':[{'message':{'content':json.dumps({'brand':'Test','product_name':'Cream','confidence':.92})}}]})
                 if body.get('stream'):
-                    duplicate='{"summary":"first","official_facts":[],"claim_evidence_audit":[],"evidence_gaps":[]}\n{"summary":"second","official_facts":[],"claim_evidence_audit":[],"evidence_gaps":[]}'
-                    chunk={'id':'stream-request','choices':[{'delta':{'content':duplicate}}]}
+                    truncated='{"summary":"first","official_facts":[],"claim_evidence_audit":['
+                    chunk={'id':'stream-request','choices':[{'delta':{'content':truncated}}]}
                     return httpx.Response(200,text='data: '+json.dumps(chunk)+'\n\ndata: [DONE]\n\n')
                 repaired={'summary':'repaired','official_facts':[],'claim_evidence_audit':[],'evidence_gaps':[]}
                 return httpx.Response(200,json={'id':'repair-request','choices':[{'message':{'content':json.dumps(repaired)}}]})
@@ -172,6 +172,9 @@ class WorkbenchLiveTests(unittest.TestCase):
             self.assertTrue(report_requests[0]['stream'])
             self.assertFalse(report_requests[1]['stream'])
             self.assertIn('修复要求',report_requests[1]['messages'][0]['content'])
+            self.assertIn('必须优先返回完整 JSON',report_requests[1]['messages'][0]['content'])
+            self.assertEqual(report_requests[0]['max_tokens'],1200)
+            self.assertEqual(report_requests[1]['max_tokens'],2000)
             self.assertTrue(all(body['response_format']=={'type':'json_object'} for body in report_requests))
         asyncio.run(scenario())
 

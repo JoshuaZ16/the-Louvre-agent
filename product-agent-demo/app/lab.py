@@ -26,6 +26,7 @@ REPORT_PROMPT = """基于当前这一张图片、产品识别和检索材料生�
 "official_facts":[{"fact":"","source_ids":[]}],
 "claim_evidence_audit":[{"claim":"","status":"待核验","reason":"","source_ids":[]}],"evidence_gaps":[]}
 status 可取：有资料支持、部分支持、待核验、存在冲突。未查到不等于虚假。"""
+REPAIR_REPORT_PROMPT = """输出预算：必须优先返回完整 JSON，而不是穷尽材料。摘要不超过60字；claims 最多6条、每条不超过60字；official_facts 最多3条、每条不超过100字；claim_evidence_audit 最多5条，其中 claim 不超过80字、reason 不超过120字；evidence_gaps 和 image_observations 各最多4条、每条不超过80字。信息不确定或篇幅不足时直接省略低优先级条目，数组可为空。"""
 SKILL_DEFAULT = "优先产品基础事实、官方功效依据和使用方法。保留实验样本量、时间和指标。只分析当前图片，不批量处理多篇种草文案。"
 AGENT_ROLES = {
     "facts": "你是产品事实智能体。核对产品身份、规格、成分、制造商与用法。区分包装可见内容和网页来源支持的事实。",
@@ -384,8 +385,8 @@ async def run_models(options, image):
                     user_content = [{"type":"text","text":task_content}]
                     if image:
                         user_content.insert(0, {"type":"image_url","image_url":{"url":image}})
-                    def report_body(stream, prompt=system):
-                        body={"model":mc.model,"temperature":mc.temperature,"max_tokens":1200,"stream":stream,
+                    def report_body(stream, prompt=system, max_tokens=1200):
+                        body={"model":mc.model,"temperature":mc.temperature,"max_tokens":max_tokens,"stream":stream,
                             "messages":[{"role":"system","content":prompt},{"role":"user","content":user_content}]}
                         if is_bailian_endpoint(mc.base_url):
                             body["response_format"] = {"type":"json_object"}
@@ -420,9 +421,9 @@ async def run_models(options, image):
                             parsed=validate_report(parse_json(text),sources)
                         except ReportFormatError as initial_error:
                             await put("model_retry",model_id=mid,message="报告格式异常，正在自动修复")
-                            repair_prompt = system + "\n修复要求：上一份输出无法解析。现在只返回一个完整、有效的 JSON 对象；不要 Markdown、说明文字、前后缀或第二个 JSON。"
+                            repair_prompt = system + "\n修复要求：上一份输出无法解析。现在只返回一个完整、有效的 JSON 对象；不要 Markdown、说明文字、前后缀或第二个 JSON。\n" + REPAIR_REPORT_PROMPT
                             try:
-                                response=await client.post(mc.chat_url,headers={"Authorization":f"Bearer {mc.api_key}"},json=report_body(False, repair_prompt))
+                                response=await client.post(mc.chat_url,headers={"Authorization":f"Bearer {mc.api_key}"},json=report_body(False, repair_prompt, 2000))
                                 response.raise_for_status()
                                 payload=response.json()
                                 content=payload.get("choices", [{}])[0].get("message", {}).get("content")
