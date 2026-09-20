@@ -3,7 +3,7 @@ import json
 import unittest
 from unittest.mock import patch
 import httpx
-from app.lab import normalize_identity, parse_json, retrieve, run_models, sources_from, validate_report
+from app.lab import ReportFormatError, normalize_identity, parse_json, retrieve, run_models, sources_from, validate_report
 
 class WorkbenchLiveTests(unittest.TestCase):
     def test_identity_classifier_keeps_one_post_small_and_marks_collage_for_separate_batch_items(self):
@@ -60,9 +60,17 @@ class WorkbenchLiveTests(unittest.TestCase):
     def test_report_json_accepts_one_fenced_object_after_explanation(self):
         text='报告如下。来源为空，因此全部待核验。\n```json\n{"summary":"实际模型报告","claims":[]}\n```'
         self.assertEqual(parse_json(text)['summary'],'实际模型报告')
+        duplicate='```json\n{"summary":"实际模型报告","claims":[]}\n```\n{"claims":[],"summary":"实际模型报告"}'
+        self.assertEqual(parse_json(duplicate)['summary'],'实际模型报告')
         for invalid in ['报告尚未生成', '```json\n{"summary":"截断',
                         '```json\n{"summary":"a"}\n```\n```json\n{"summary":"b"}\n```']:
-            with self.assertRaises(ValueError):parse_json(invalid)
+            with self.assertRaises(ReportFormatError):parse_json(invalid)
+
+    def test_report_json_rejects_nested_object_in_truncated_json(self):
+        with self.assertRaisesRegex(ReportFormatError,'完整'):
+            parse_json('{"report":{"summary":"截断"}')
+        with self.assertRaises(ReportFormatError):
+            parse_json('[{"summary":"不是顶层对象"}]')
 
     def test_search_stream_keeps_completed_sources_and_progress(self):
         seen=[];progress=[]
@@ -109,6 +117,91 @@ class WorkbenchLiveTests(unittest.TestCase):
             self.assertEqual(len(set(started)),3)
             self.assertTrue(all(any(p.get('type')=='image_url' for p in b['messages'][1]['content']) for b in bodies))
             self.assertEqual({e['model_id'] for e in events if e['type']=='report'},{'facts','review','visual'})
+        asyncio.run(scenario())
+
+    def test_bailian_report_stream_uses_json_mode_but_custom_endpoint_does_not(self):
+        async def collect(base_url):
+            bodies=[]
+            async def handler(request):
+                body=json.loads(request.content);bodies.append(body)
+                report={'summary':'result','official_facts':[],'claim_evidence_audit':[],'evidence_gaps':[]}
+                chunk={'choices':[{'delta':{'content':json.dumps(report)}}]}
+                return httpx.Response(200,text='data: '+json.dumps(chunk)+'\n\ndata: [DONE]\n\n')
+            real=httpx.AsyncClient
+            with patch('app.lab.httpx.AsyncClient',side_effect=lambda **kw:real(transport=httpx.MockTransport(handler),**kw)):
+                events=[json.loads(s.removeprefix('data: ')) async for s in run_models(
+                    {'models':[{'id':'report','base_url':base_url,'api_key':'x','model':'qwen3.8-max'}],
+                     'query':'product','search_enabled':False},None)]
+            self.assertIn('report',[event['type'] for event in events])
+            return bodies[0]
+        bailian=asyncio.run(collect('https://dashscope.aliyuncs.com/compatible-mode/v1'))
+        custom=asyncio.run(collect('https://model.example/v1'))
+        self.assertEqual(bailian['response_format'],{'type':'json_object'})
+        self.assertFalse(bailian['enable_thinking'])
+        self.assertNotIn('response_format',custom)
+        self.assertNotIn('enable_thinking',custom)
+
+    def test_report_format_retry_reuses_context_without_repeating_vision_or_search(self):
+        async def scenario():
+            requests=[];retrieval_calls=[]
+            async def handler(request):
+                body=json.loads(request.content);requests.append(body)
+                if body['model']=='vision-model':
+                    return httpx.Response(200,json={'choices':[{'message':{'content':json.dumps({'brand':'Test','product_name':'Cream','confidence':.92})}}]})
+                if body.get('stream'):
+                    duplicate='{"summary":"first","official_facts":[],"claim_evidence_audit":[],"evidence_gaps":[]}\n{"summary":"second","official_facts":[],"claim_evidence_audit":[],"evidence_gaps":[]}'
+                    chunk={'id':'stream-request','choices':[{'delta':{'content':duplicate}}]}
+                    return httpx.Response(200,text='data: '+json.dumps(chunk)+'\n\ndata: [DONE]\n\n')
+                repaired={'summary':'repaired','official_facts':[],'claim_evidence_audit':[],'evidence_gaps':[]}
+                return httpx.Response(200,json={'id':'repair-request','choices':[{'message':{'content':json.dumps(repaired)}}]})
+            async def search(*args,**kwargs):
+                retrieval_calls.append(True)
+                return ([{'source_id':'s1','url':'https://www.nifdc.org.cn/product','title':'Product','trusted':True}],'Source text')
+            real=httpx.AsyncClient
+            with patch('app.lab.httpx.AsyncClient',side_effect=lambda **kw:real(transport=httpx.MockTransport(handler),**kw)),patch('app.lab.retrieve',side_effect=search):
+                events=[json.loads(s.removeprefix('data: ')) async for s in run_models(
+                    {'models':[{'id':'report','base_url':'https://dashscope.aliyuncs.com/compatible-mode/v1','api_key':'x','model':'report-model'}],
+                     'vision_model':'vision-model','search_enabled':True},'data:image/png;base64,a')]
+            self.assertEqual([event['type'] for event in events].count('model_retry'),1)
+            report=next(event['report'] for event in events if event['type']=='report')
+            self.assertEqual(report['summary'],'repaired')
+            self.assertEqual(len(retrieval_calls),1)
+            self.assertEqual(len([body for body in requests if body['model']=='vision-model']),1)
+            report_requests=[body for body in requests if body['model']=='report-model']
+            self.assertEqual(len(report_requests),2)
+            self.assertTrue(report_requests[0]['stream'])
+            self.assertFalse(report_requests[1]['stream'])
+            self.assertIn('修复要求',report_requests[1]['messages'][0]['content'])
+            self.assertTrue(all(body['response_format']=={'type':'json_object'} for body in report_requests))
+        asyncio.run(scenario())
+
+    def test_failed_format_repair_only_fails_the_affected_agent(self):
+        async def scenario():
+            requests=[]
+            async def handler(request):
+                body=json.loads(request.content);requests.append(body)
+                model=body['model']
+                if not body.get('stream'):
+                    self.assertEqual(model,'bad-model')
+                    return httpx.Response(200,json={'choices':[{'message':{'content':'still not JSON'}}]})
+                if model=='bad-model':
+                    text='{"summary":"first"}\n{"summary":"second"}'
+                else:
+                    text=json.dumps({'summary':model,'official_facts':[],'claim_evidence_audit':[],'evidence_gaps':[]})
+                chunk={'choices':[{'delta':{'content':text}}]}
+                return httpx.Response(200,text='data: '+json.dumps(chunk)+'\n\ndata: [DONE]\n\n')
+            real=httpx.AsyncClient
+            models=[{'id':'bad','base_url':'https://model.example/v1','api_key':'x','model':'bad-model'},
+                    {'id':'facts','base_url':'https://model.example/v1','api_key':'x','model':'facts-model'},
+                    {'id':'visual','base_url':'https://model.example/v1','api_key':'x','model':'visual-model'}]
+            with patch('app.lab.httpx.AsyncClient',side_effect=lambda **kw:real(transport=httpx.MockTransport(handler),**kw)):
+                events=[json.loads(s.removeprefix('data: ')) async for s in run_models({'models':models,'query':'product','search_enabled':False},None)]
+            self.assertEqual({event['model_id'] for event in events if event['type']=='report'},{'facts','visual'})
+            errors=[event for event in events if event['type']=='model_error']
+            self.assertEqual([event['model_id'] for event in errors],['bad'])
+            self.assertIn('初始报告格式错误',errors[0]['message'])
+            self.assertEqual([event['model_id'] for event in events if event['type']=='model_retry'],['bad'])
+            self.assertEqual(len([body for body in requests if body['model']=='bad-model' and not body.get('stream')]),1)
         asyncio.run(scenario())
 
     def test_qwen38_search_uses_responses_and_preserves_actual_sources(self):

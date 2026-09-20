@@ -33,6 +33,15 @@ AGENT_ROLES = {
     "visual": "你是图片核查智能体。直接检查上传的原始图片、包装文字和可见区域。仅有单张图时不要声称与其他图片存在差异，不要推断真伪。将可见观察放入 image_observations，需补充的材料放入 evidence_gaps。",
 }
 
+
+class ReportFormatError(ValueError):
+    """Raised when a completed model response cannot supply one unambiguous report object."""
+
+
+def is_bailian_endpoint(base_url):
+    host = (urlparse(str(base_url)).hostname or "").lower()
+    return host == "dashscope.aliyuncs.com" or host.endswith(".maas.aliyuncs.com")
+
 def config(raw):
     c = ModelConfig.from_dict(raw)
     if not http_url(c.base_url):
@@ -53,31 +62,33 @@ def error_text(exc):
     return "服务返回格式异常，请检查模型或工具协议"
 
 def parse_json(text):
-    """Extract exactly one object from common model wrappers without accepting batches."""
+    """Extract one complete report object, accepting only identical duplicate wrappers."""
     clean = str(text or "").strip()
-    blocks = re.findall(r"```(?:json)?\s*([\s\S]*?)```", clean, flags=re.IGNORECASE)
-    if len(blocks) > 1:
-        raise ValueError("模型返回了多个 JSON 对象，已拒绝批量结果")
-    candidate = blocks[0].strip() if blocks else clean
     decoder = json.JSONDecoder()
-    starts = [m.start() for m in re.finditer(r"\{", candidate)]
-    for start in starts:
+    objects, cursor = [], 0
+    while True:
+        object_start, array_start = clean.find("{", cursor), clean.find("[", cursor)
+        starts = [start for start in (object_start, array_start) if start >= 0]
+        start = min(starts) if starts else -1
+        if start < 0:
+            break
         try:
-            data, end = decoder.raw_decode(candidate[start:])
+            data, end = decoder.raw_decode(clean[start:])
         except json.JSONDecodeError:
+            # A JSON-looking, unfinished outer object must not allow us to pick an inner object.
+            if re.match(r'\{\s*"', clean[start:]):
+                raise ReportFormatError("模型未返回完整的 JSON 对象")
+            cursor = start + 1
             continue
-        if not isinstance(data, dict):
-            continue
-        tail = candidate[start + end:]
-        # Explanatory prose after one object is tolerated, but a second object is not.
-        for extra in re.finditer(r"\{", tail):
-            try:
-                decoder.raw_decode(tail[extra.start():])
-            except json.JSONDecodeError:
-                continue
-            raise ValueError("模型返回了多个 JSON 对象，已拒绝批量结果")
-        return data
-    raise ValueError("模型未返回可解析的 JSON 对象")
+        cursor = start + end
+        if isinstance(data, dict):
+            objects.append(data)
+    if not objects:
+        raise ReportFormatError("模型未返回可解析的 JSON 对象")
+    canonical = [json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":")) for data in objects]
+    if any(value != canonical[0] for value in canonical[1:]):
+        raise ReportFormatError("模型返回了多个内容不同的 JSON 对象，已拒绝歧义结果")
+    return objects[0]
 
 def normalize_identity(data):
     """Keep the shared context small and preserve the distinction between UGC and official input."""
@@ -243,8 +254,7 @@ async def retrieve(raw, query, mcp, search=None, progress=None):
         raise ValueError("请选择有效的检索服务")
     c = config(raw)
     search_key = search.get("api_key") or c.api_key
-    host = urlparse(c.base_url).hostname or ""
-    official_host = host == "dashscope.aliyuncs.com" or host.endswith(".maas.aliyuncs.com")
+    official_host = is_bailian_endpoint(c.base_url)
     if not search.get("api_key") and not official_host:
         raise ValueError("百炼联网需要北京区 API Key；自定义模型可另填检索 Key 或选择 Tavily / MCP")
     search_base = str(search.get("base_url") or (c.base_url if official_host else "https://dashscope.aliyuncs.com/compatible-mode/v1")).rstrip("/")
@@ -316,11 +326,12 @@ async def run_models(options, image):
             await put("started",message="开始读取产品信息")
             if image:
                 body={"model":options.get("vision_model") or c.model,
-                    "temperature":0,"max_tokens":800,"response_format":{"type":"json_object"},
+                    "temperature":0,"max_tokens":800,
                     "messages":[{"role":"system","content":options.get("vision_prompt") or VISION_PROMPT},
                         {"role":"user","content":[{"type":"image_url","image_url":{"url":image}},
                             {"type":"text","text":query or "读取产品名称、规格和可见声明"}]}]}
-                if (urlparse(c.base_url).hostname or "").endswith("aliyuncs.com"):
+                if is_bailian_endpoint(c.base_url):
+                    body["response_format"] = {"type":"json_object"}
                     body["enable_thinking"] = False
                 async with httpx.AsyncClient(timeout=c.timeout_seconds) as client:
                     r=await client.post(c.chat_url,headers={"Authorization":f"Bearer {c.api_key}"},json=body)
@@ -373,20 +384,27 @@ async def run_models(options, image):
                     user_content = [{"type":"text","text":task_content}]
                     if image:
                         user_content.insert(0, {"type":"image_url","image_url":{"url":image}})
-                    body={"model":mc.model,"temperature":mc.temperature,"max_tokens":1200,"stream":True,
-                        "messages":[{"role":"system","content":system},{"role":"user","content":user_content}]}
-                    if (urlparse(mc.base_url).hostname or "").endswith("aliyuncs.com"):
-                        body["enable_thinking"]=False
+                    def report_body(stream, prompt=system):
+                        body={"model":mc.model,"temperature":mc.temperature,"max_tokens":1200,"stream":stream,
+                            "messages":[{"role":"system","content":prompt},{"role":"user","content":user_content}]}
+                        if is_bailian_endpoint(mc.base_url):
+                            body["response_format"] = {"type":"json_object"}
+                            body["enable_thinking"] = False
+                        return body
+                    body=report_body(True)
                     await put("model_started",model_id=mid,model=mc.model,agent_name=raw.get("name", mid))
                     first_token=None
                     request_id = None
+                    stream_completed = False
                     async with httpx.AsyncClient(timeout=mc.timeout_seconds) as client:
                         async with client.stream("POST",mc.chat_url,headers={"Authorization":f"Bearer {mc.api_key}"},json=body) as r:
                             r.raise_for_status()
                             async for line in r.aiter_lines():
                                 if not line.startswith("data:"): continue
                                 fragment=line[5:].strip()
-                                if fragment=="[DONE]": break
+                                if fragment=="[DONE]":
+                                    stream_completed = True
+                                    break
                                 chunk=json.loads(fragment)
                                 request_id = chunk.get("id") or request_id
                                 if chunk.get("error"): raise ValueError("模型流返回错误")
@@ -396,7 +414,25 @@ async def run_models(options, image):
                                     if first_token is None: first_token=round((time.monotonic()-begin)*1000)
                                     text+=delta
                                     await put("token",model_id=mid,text=delta)
-                    parsed=validate_report(parse_json(text),sources)
+                        if not stream_completed:
+                            raise ValueError("模型流未返回完成标记")
+                        try:
+                            parsed=validate_report(parse_json(text),sources)
+                        except ReportFormatError as initial_error:
+                            await put("model_retry",model_id=mid,message="报告格式异常，正在自动修复")
+                            repair_prompt = system + "\n修复要求：上一份输出无法解析。现在只返回一个完整、有效的 JSON 对象；不要 Markdown、说明文字、前后缀或第二个 JSON。"
+                            try:
+                                response=await client.post(mc.chat_url,headers={"Authorization":f"Bearer {mc.api_key}"},json=report_body(False, repair_prompt))
+                                response.raise_for_status()
+                                payload=response.json()
+                                content=payload.get("choices", [{}])[0].get("message", {}).get("content")
+                                if not isinstance(content, str):
+                                    raise ReportFormatError("自动修复未返回文本 JSON 内容")
+                                parsed=validate_report(parse_json(content),sources)
+                                request_id = payload.get("id") or request_id
+                            except Exception as repair_error:
+                                raise ReportFormatError(
+                                    f"初始报告格式错误：{error_text(initial_error)}；自动修复失败：{error_text(repair_error)}") from repair_error
                     parsed.update(model=mc.model,agent_role=role,agent_name=raw.get("name", mid),request_id=request_id,retrieval_status=source_status,
                         timing={"first_token_ms":first_token,"generation_ms":round((time.monotonic()-begin)*1000)})
                     await put("report",model_id=mid,report=parsed)
@@ -447,7 +483,7 @@ async def test_model(raw: dict):
         c = config(raw)
         body = {"model": c.model, "messages": [{"role": "user", "content": "Reply OK."}],
                 "max_tokens": 16, "stream": False}
-        if (urlparse(c.base_url).hostname or "").endswith("aliyuncs.com"):
+        if is_bailian_endpoint(c.base_url):
             body["enable_thinking"] = False
         async with httpx.AsyncClient(timeout=c.timeout_seconds) as client:
             response = await client.post(c.chat_url,

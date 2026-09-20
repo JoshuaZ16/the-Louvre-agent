@@ -28,6 +28,7 @@ export function reduceRun(previous,event){
    set('report','running','三个 Agent 正在独立分析');
    Object.assign(agent(),{status:'running',message:'正在读取图片与共享资料',model:event.model});break;
   case 'token':agent().draft+=event.text||'';r.draft+=event.text||'';break;
+  case 'model_retry':Object.assign(agent(),{status:'running',message:event.message||'报告格式异常，正在自动修复'});break;
   case 'report':{
    Object.assign(agent(),{status:'done',message:'分析完成',report:event.report});r.reports[id]=event.report;
    const reports=Object.values(r.reports);
