@@ -3,9 +3,40 @@ import json
 import unittest
 from unittest.mock import patch
 import httpx
-from app.lab import ReportFormatError, normalize_identity, parse_json, retrieve, run_models, sources_from, stable_input_id, validate_report
+from app.lab import ReportFormatError, error_text, normalize_identity, parse_json, retrieve, run_models, sources_from, stable_input_id, validate_report
 
 class WorkbenchLiveTests(unittest.TestCase):
+    def test_upstream_status_errors_explain_key_and_quota_failures(self):
+        self.assertIn('API Key', error_text(httpx.HTTPStatusError('x', request=httpx.Request('POST', 'https://example.com'), response=httpx.Response(401))))
+        self.assertIn('权限', error_text(httpx.HTTPStatusError('x', request=httpx.Request('POST', 'https://example.com'), response=httpx.Response(403))))
+        self.assertIn('额度', error_text(httpx.HTTPStatusError('x', request=httpx.Request('POST', 'https://example.com'), response=httpx.Response(429))))
+
+    def test_vision_report_retries_with_compact_schema_after_truncated_json(self):
+        async def scenario():
+            requests=[]
+            async def handler(request):
+                body=json.loads(request.content); requests.append(body)
+                if len(requests) == 1:
+                    truncated=json.dumps({'input_type':'product_packaging','brand':'Test'})[:-1]
+                    return httpx.Response(200, json={'choices':[{'message':{'content':truncated}}]})
+                if body.get('stream'):
+                    report={'summary':'fixture report','official_facts':[],'claim_evidence_audit':[],'evidence_gaps':[]}
+                    chunk={'choices':[{'delta':{'content':json.dumps(report)}}]}
+                    return httpx.Response(200,text='data: '+json.dumps(chunk)+'\n\ndata: [DONE]\n\n')
+                return httpx.Response(200, json={'choices':[{'message':{'content':json.dumps({'input_type':'product_packaging','brand':'Test','product_name':'Cream','confidence':.95})}}]})
+            real=httpx.AsyncClient
+            with patch('app.lab.httpx.AsyncClient',side_effect=lambda **kw:real(transport=httpx.MockTransport(handler),**kw)):
+                events=[json.loads(s.removeprefix('data: ')) async for s in run_models({
+                    'models':[{'id':'facts','agent_role':'facts','model':'report-model','base_url':'https://model.example/v1','api_key':'x'}],
+                    'vision_model':'vision-model','search_enabled':False,
+                },'data:image/png;base64,a')]
+            self.assertEqual(len(requests),3)
+            self.assertEqual(requests[0]['max_tokens'],1400)
+            self.assertEqual(requests[1]['max_tokens'],1200)
+            self.assertEqual(next(event['product']['brand'] for event in events if event['type']=='product_identified'),'Test')
+            self.assertNotIn('error',[event['type'] for event in events])
+        asyncio.run(scenario())
+
     def test_structured_claim_contract_preserves_conditions_entities_and_stable_id(self):
         raw = {
             'brand': '示例品牌', 'product_name': '示例精华', 'specification': '30ml',
@@ -236,6 +267,7 @@ class WorkbenchLiveTests(unittest.TestCase):
             self.assertEqual(report_task['input_id'], 'input-review')
             self.assertEqual(report_task['claims_structured'][0]['claim_id'], claim_id)
             self.assertEqual(report_task['claim_coverage']['processed_count'], 1)
+            self.assertNotIn('claims_structured', report_task['image_reading'])
         asyncio.run(scenario())
 
     def test_bailian_report_stream_uses_json_mode_but_custom_endpoint_does_not(self):

@@ -6,21 +6,22 @@ const MAX_BATCH_CONCURRENCY=3;
 const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const icon=n=>`<svg class="icon" aria-hidden="true"><use href="/static/assets/icons/feather-sprite.svg#${esc(n)}"></use></svg>`;
 const hydrate=(root=document)=>root.querySelectorAll('[data-icon]').forEach(e=>e.innerHTML=icon(e.dataset.icon));
-const baseline={provider:'bailian',base_url:'https://dashscope.aliyuncs.com/compatible-mode/v1',vision_model:'qwen3.8-max',model:'qwen3.8-max',facts_model:'',review_model:'',visual_model:'',facts_prompt:'',review_prompt:'',visual_prompt:'',search_base_url:'',api_key:'',timeout_seconds:90,search_provider:'bailian',search_key:'',mcp_url:'',mcp_key:'',tool_name:'',mcp_arguments:'{"query":"{{query}}"}',vision_prompt:'',report_prompt:''};
+const baseline={provider:'bailian',base_url:'https://dashscope.aliyuncs.com/compatible-mode/v1',vision_model:'qwen3.8-max',model:'qwen3.8-max',facts_model:'',review_model:'',visual_model:'',facts_prompt:'',review_prompt:'',visual_prompt:'',search_base_url:'',api_key:'',timeout_seconds:90,search_provider:'tavily',search_key:'',mcp_url:'',mcp_key:'',tool_name:'',mcp_arguments:'{"query":"{{query}}"}',vision_prompt:'',report_prompt:''};
 let saved={};try{saved=JSON.parse(localStorage.getItem('trustlens.live.connection.v1'))||{};}catch{}
 let config={...baseline,...safeConfig(saved),api_key:'',search_key:'',mcp_key:''};
+let envKeys={model:false,search:false};
 const state={sources:[],selected:0,tab:'setup',running:false,logs:[],tool:'select',zoom:1,fit:1,pan:{x:0,y:0},marking:false,selectedAgent:'facts',message:'',messageType:'',testing:false,runId:0};
 let controllers=[],activeBatch=[],cancelRequested=false,toastTimer,lastFocused,framePending=false;
 const active=()=>state.sources[state.selected];
 const run=()=>active()?.run||emptyRun();
-const hasKey=()=>!!config.api_key||/^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])([:/]|$)/i.test(config.base_url);
+const hasKey=()=>!!config.api_key||envKeys.model||/^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])([:/]|$)/i.test(config.base_url);
 const labels={idle:'等待',running:'执行中',done:'已完成',error:'失败',attention:'需补充',skipped:'未启用',cancelled:'已取消'};
 function toast(text){$('#toast').textContent=text;$('#toast').classList.add('show');clearTimeout(toastTimer);toastTimer=setTimeout(()=>$('#toast').classList.remove('show'),3500);}
 function dialog(title,html){lastFocused=document.activeElement;$('#dialogTitle').textContent=title;$('#dialogBody').innerHTML=html;hydrate($('#dialog'));if(!$('#dialog').open)$('#dialog').showModal();}
 function closeDialog(){$('#dialog').close();lastFocused?.focus();}
 function openInspector(tab='setup'){state.tab=tab;$('.body').classList.remove('drawer-closed');$('#inspector').inert=false;$('#openInspector').hidden=true;renderInspector();}
 function setMessage(text,type=''){state.message=text;state.messageType=type;const box=$('#configMessage');if(box){box.textContent=text;box.className=`inline-note sr-message ${type?type+'-note':''}`;box.hidden=!text;}}
-function saveConfig(){localStorage.setItem('trustlens.live.connection.v1',JSON.stringify(safeConfig(config)));updateConnection();setMessage('配置已保存。API Key 仅保留在当前页面，刷新后需重新填写。','success');}
+function saveConfig(){localStorage.setItem('trustlens.live.connection.v1',JSON.stringify(safeConfig(config)));updateConnection();setMessage('配置已保存。API Key 由本机环境变量提供，不会写入浏览器存储。','success');}
 function updateConnection(){$('#connectionName').textContent=config.vision_model||'连接你的模型';$('#connectionState').textContent=hasKey()?'连接参数已填写':'API Key 尚未填写';$('#connectionDot').classList.toggle('configured',hasKey());}
 function input(name,label,type='text',hint=''){return `<label>${label}<input data-config="${name}" type="${type}" value="${esc(config[name])}" ${type==='password'?'autocomplete="off" class="key-field"':''} ${state.running?'disabled':''}>${hint?`<small class="field-hint">${hint}</small>`:''}</label>`;}
 function options(name,values){return `<select data-config="${name}" ${state.running?'disabled':''}>${values.map(([v,t])=>`<option value="${v}" ${config[name]===v?'selected':''}>${t}</option>`).join('')}</select>`;}
@@ -67,7 +68,7 @@ function agentResultHTML(id){
  return html;
 }
 function currentStage(){const r=run();if(r.stages.identify.status==='running')return '图片识别';if(r.stages.search.status==='running')return '资料检索';if(r.stages.report.status==='running')return '三 Agent 并行分析';return '等待返回';}
-function renderStatus(){const r=run(),p=batchProgress(state.sources),batch=p.total>1;const status=state.running?(batch?`批量分析 ${p.finished}/${p.total} · ${currentStage()}`:currentStage()):batch&&p.failed>0?'批量有失败':r.error||r.stages.search.status==='error'?'需处理':batch&&p.successful===p.total?'批量完成':r.report?'已完成':active()?'待分析':'等待图片';$('#runStatus').textContent=status;$('#runButton').innerHTML=`${icon(state.running?'square':'play')}${state.running?'取消分析':batch?`批量运行 ${p.total} 张`:'运行三个 Agent'}`;$('#taskTitle').textContent=r.identity?.product_name||(batch?`批量产品内容分析`:'产品识别与资料检索');$('#taskSubtitle').textContent=state.running?'每张图片独立识别、检索，并启动三个 Agent':batch?`已添加 ${p.total} 张图片；结果按图片隔离` :r.elapsed?`本次耗时 ${(r.elapsed/1000).toFixed(1)} 秒 · ${r.sources.length} 个检索来源`:'上传产品图片，让每一条结论都有来源';}
+function renderStatus(){const r=run(),p=batchProgress(state.sources),batch=p.total>1,failed=!!r.error||r.stages.search.status==='error';const status=state.running?(batch?`批量分析 ${p.finished}/${p.total} · ${currentStage()}`:currentStage()):batch&&p.failed>0?'批量有失败':failed?'分析失败':batch&&p.successful===p.total?'批量完成':r.report?'已完成':active()?'待分析':'等待图片';$('#runStatus').textContent=status;$('#runButton').innerHTML=`${icon(state.running?'square':'play')}${state.running?'取消分析':failed?'重试三个 Agent':batch?`批量运行 ${p.total} 张`:'运行三个 Agent'}`;$('#taskTitle').textContent=r.identity?.product_name||(batch?`批量产品内容分析`:'产品识别与资料检索');$('#taskSubtitle').textContent=state.running?'每张图片独立识别、检索，并启动三个 Agent':r.error?`本次分析未完成：${r.error}`:batch?`已添加 ${p.total} 张图片；结果按图片隔离` :r.elapsed?`本次耗时 ${(r.elapsed/1000).toFixed(1)} 秒 · ${r.sources.length} 个检索来源`:'上传产品图片，让每一条结论都有来源';}
 function render(){renderSources();renderInspector();renderStatus();updateConnection();fit();}
 function scheduleRender(){if(framePending)return;framePending=true;requestAnimationFrame(()=>{framePending=false;renderSources();renderStatus();if(state.tab!=='setup')renderInspector();});}
 function transform(){$('#canvasWorld').style.transform=`translate(${state.pan.x}px,${state.pan.y}px) scale(${state.fit*state.zoom})`;$('#zoomLabel').textContent=`${Math.round(state.zoom*100)}%`;}
@@ -77,7 +78,7 @@ function drawConnections(){const c=$('#connections'),ctx=c.getContext('2d');ctx.
 function addLog(text,error=false){state.logs.push({text,error,time:new Date().toLocaleTimeString('zh-CN',{hour12:false})});}
 async function addFiles(files){if(state.running){toast('请等待本次分析结束，或先取消。');return;}let rejected=0,first=-1;for(const file of [...files]){if(state.sources.length>=MAX_BATCH_ITEMS){rejected++;continue;}if(!['image/png','image/jpeg','image/webp'].includes(file.type)||file.size>10*1024*1024||!file.size){rejected++;continue;}const url=URL.createObjectURL(file),s={id:crypto.randomUUID(),file,url,name:file.name,run:emptyRun(),hint:'',regions:[]};try{const bitmap=await createImageBitmap(file);s.width=bitmap.width;s.height=bitmap.height;bitmap.close();}catch{URL.revokeObjectURL(url);rejected++;continue;}if(first<0)first=state.sources.length;state.sources.push(s);}if(first>=0){state.selected=first;state.logs=[];state.message='';render();}if(rejected)toast(`${rejected} 个文件未添加：请选择 10 MB 以内的有效 PNG / JPG / WEBP 图片，单批最多 ${MAX_BATCH_ITEMS} 张。`);}
 function newInvestigation(){if(state.running){toast('请先取消或等待当前分析结束。');return;}state.sources.forEach(s=>URL.revokeObjectURL(s.url));state.sources=[];state.selected=0;state.logs=[];state.message='';render();}
-function validate(){if(!/^https?:\/\//i.test(config.base_url))return '请输入有效的 API Base URL。';if(!config.vision_model.trim())return '请填写支持图片的模型 ID。';if(!hasKey())return '请填写模型 API Key。';if(+config.timeout_seconds<5||+config.timeout_seconds>300)return '超时时间应为 5–300 秒。';if(config.search_provider==='tavily'&&!config.search_key.trim())return '请填写 Tavily API Key，或选择其他检索服务。';if(config.search_provider==='bailian'&&!config.search_key.trim()&&!(new URL(config.base_url).hostname==='dashscope.aliyuncs.com'||new URL(config.base_url).hostname.endsWith('.maas.aliyuncs.com')))return '请另填百炼北京区检索 Key，或选择 Tavily / MCP。';if(config.search_provider==='mcp'){if(!/^https?:\/\//i.test(config.mcp_url)||!config.tool_name.trim())return '请填写 MCP 地址并选择检索工具。';try{const a=JSON.parse(config.mcp_arguments);if(!a||Array.isArray(a)||typeof a!=='object')throw 0;}catch{return 'MCP 参数必须是 JSON 对象。';}}return '';}
+function validate(){if(!/^https?:\/\//i.test(config.base_url))return '请输入有效的 API Base URL。';if(!config.vision_model.trim())return '请填写支持图片的模型 ID。';if(!hasKey())return '请填写模型 API Key。';if(+config.timeout_seconds<5||+config.timeout_seconds>300)return '超时时间应为 5–300 秒。';if(config.search_provider==='tavily'&&!config.search_key.trim()&&!envKeys.search)return '请填写 Tavily API Key，或选择其他检索服务。';if(config.search_provider==='bailian'&&!config.search_key.trim()&&!(new URL(config.base_url).hostname==='dashscope.aliyuncs.com'||new URL(config.base_url).hostname.endsWith('.maas.aliyuncs.com')))return '请另填百炼北京区检索 Key，或选择 Tavily / MCP。';if(config.search_provider==='mcp'){if(!/^https?:\/\//i.test(config.mcp_url)||!config.tool_name.trim())return '请填写 MCP 地址并选择检索工具。';try{const a=JSON.parse(config.mcp_arguments);if(!a||Array.isArray(a)||typeof a!=='object')throw 0;}catch{return 'MCP 参数必须是 JSON 对象。';}}return '';}
 function requestOptions(source=active()){
  return {input_id:source?.id||'',models:Object.entries(agentDefinitions).map(([id,a])=>({id,name:a.name,agent_role:id,instructions:config[id+'_prompt']||'',base_url:config.base_url.trim(),api_key:config.api_key,model:(config[id+'_model']||config.model||config.vision_model).trim(),timeout_seconds:+config.timeout_seconds,temperature:0})),vision_model:config.vision_model.trim(),query:source?.hint.trim()||'',vision_prompt:config.vision_prompt,report_prompt:config.report_prompt,skill_enabled:false,search_enabled:config.search_provider!=='none',search:{provider:config.search_provider,api_key:config.search_key,base_url:config.search_base_url,model:config.model||config.vision_model},mcp:{enabled:config.search_provider==='mcp',url:config.mcp_url,api_key:config.mcp_key,tool_name:config.tool_name,arguments:config.search_provider==='mcp'?JSON.parse(config.mcp_arguments):{query:'{{query}}'}}};
 }
@@ -102,8 +103,13 @@ async function runSource(s,index,total,runId){
    }
    scheduleRender();
   });
-  while(true){const {value,done}=await reader.read();if(done){parse(decoder.decode());break;}parse(decoder.decode(value,{stream:true}));}
-  if(!finished&&!s.run.report&&!s.run.error)throw new Error('连接结束，但接口没有返回完整结果，请重试。');
+  while(true){const {value,done}=await reader.read();if(done){parse(decoder.decode());parse.flush();break;}parse(decoder.decode(value,{stream:true}));}
+  if(!finished)throw new Error('连接结束，但接口没有返回完成标记，请重试。');
+  if(finished&&s.run.stages.report.status==='error'&&!s.run.error){
+   const message=s.run.stages.report.message||'接口结束，但三个 Agent 没有返回有效结果。';
+   s.run=reduceRun(s.run,{type:'error',message});
+   addLog(`${s.name} · ${message}`,true);
+  }
  }catch(e){const cancelled=e.name==='AbortError',message=cancelled?'已取消本次分析':String(e.message||'连接失败');s.run=reduceRun(s.run,{type:cancelled?'cancelled':'error',message});addLog(`${s.name} · ${message}`,!cancelled);}
 }
 async function startRun(){
@@ -113,8 +119,15 @@ async function startRun(){
  const runId=++state.runId;const targets=state.sources.slice();activeBatch=targets;cancelRequested=false;state.logs=[];state.running=true;state.message='';controllers=[];render();
  let cursor=0;
  const worker=async()=>{while(!cancelRequested&&runId===state.runId&&cursor<targets.length){const index=cursor++;await runSource(targets[index],index,targets.length,runId);}};
- await Promise.allSettled(Array.from({length:Math.min(MAX_BATCH_CONCURRENCY,targets.length)},()=>worker()));
- if(runId===state.runId){state.running=false;controllers=[];activeBatch=[];render();}
+ try{
+  await Promise.allSettled(Array.from({length:Math.min(MAX_BATCH_CONCURRENCY,targets.length)},()=>worker()));
+ }catch(e){
+  const message=String(e?.message||'运行流程异常结束，请查看运行记录。');
+  for(const s of targets){if(!s.run.error&&s.run.stages.report.status==='running')s.run=reduceRun(s.run,{type:'error',message});}
+  addLog(message,true);
+ }finally{
+  if(runId===state.runId){state.running=false;controllers=[];activeBatch=[];render();}
+ }
 }
 async function testConnection(){if(state.testing)return;if(!config.vision_model||!/^https?:\/\//i.test(config.base_url)||!hasKey()){openInspector();setMessage('请先填写有效的 Base URL、模型 ID 和 API Key。','error');return;}state.testing=true;openInspector();setMessage('正在测试模型连接…');try{const r=await fetch('/api/lab/test-model',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({base_url:config.base_url,model:config.vision_model,api_key:config.api_key,timeout_seconds:+config.timeout_seconds})});const data=await r.json();setMessage(data.message||data.error||'连接测试未返回有效结果',data.status==='ok'?'success':'error');}catch{setMessage('无法连接本地服务，请检查服务是否正在运行。','error');}finally{state.testing=false;$('#testButton').disabled=false;}}
 async function discover(){if(!/^https?:\/\//i.test(config.mcp_url)){setMessage('请先填写 MCP 服务地址。','error');return;}setMessage('正在发现 MCP 工具…');try{const r=await fetch('/api/lab/mcp/discover',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:config.mcp_url,api_key:config.mcp_key})});const data=await r.json();if(data.status!=='ok')throw new Error(data.error||'工具发现失败');dialog('选择检索工具',data.tools?.length?`<ul class="report-list">${data.tools.map(t=>`<li><strong>${esc(t.name)}</strong><p>${esc(t.description||'')}</p><button class="button" data-tool="${esc(t.name)}">使用此工具</button></li>`).join('')}</ul>`:'<p>此 MCP 服务没有返回可用工具。</p>');setMessage('工具列表已读取。');}catch(e){setMessage(e.message,'error');}}
@@ -136,4 +149,5 @@ viewport.addEventListener('wheel',e=>{if(e.ctrlKey||e.metaKey){e.preventDefault(
 viewport.addEventListener('dragenter',e=>{e.preventDefault();dragDepth++;$('#dropOverlay').hidden=false;});viewport.addEventListener('dragover',e=>e.preventDefault());viewport.addEventListener('dragleave',()=>{if(--dragDepth<=0)$('#dropOverlay').hidden=true;});viewport.addEventListener('drop',e=>{e.preventDefault();dragDepth=0;$('#dropOverlay').hidden=true;addFiles(e.dataTransfer.files);});
 document.addEventListener('keydown',e=>{if(e.key==='Escape'&&state.marking){state.marking=false;renderSources();}if(e.target.closest('.tabs')&&['ArrowLeft','ArrowRight'].includes(e.key)){e.preventDefault();const tabs=['setup','activity','sources','result'];state.tab=tabs[(tabs.indexOf(state.tab)+(e.key==='ArrowRight'?1:3))%4];renderInspector();$(`#tab-${state.tab}`).focus();}if(e.target===viewport&&['+','-','0'].includes(e.key)){e.preventDefault();e.key==='0'?fit():zoom(e.key==='+'?.15:-.15);}});
 $('#dialog').addEventListener('click',e=>{if(e.target===$('#dialog'))closeDialog();});
-hydrate();render();new ResizeObserver(fit).observe(viewport);if(innerWidth<1000){$('.body').classList.add('drawer-closed');$('#inspector').inert=true;$('#openInspector').hidden=false;}
+async function loadDefaults(){try{const response=await fetch('/api/lab/defaults');if(!response.ok)return;const data=await response.json();envKeys={model:!!data.env_keys_configured?.model,search:!!data.env_keys_configured?.search};updateConnection();renderInspector();}catch{}}
+hydrate();render();loadDefaults();new ResizeObserver(fit).observe(viewport);if(innerWidth<1000){$('.body').classList.add('drawer-closed');$('#inspector').inert=true;$('#openInspector').hidden=false;}
