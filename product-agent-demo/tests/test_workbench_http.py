@@ -1,4 +1,5 @@
 import json
+import os
 import unittest
 from unittest.mock import patch
 import httpx
@@ -17,7 +18,8 @@ class WorkbenchHTTPTests(unittest.TestCase):
         self.assertNotIn('La Roche-Posay',r.text)
 
     def test_missing_key_returns_actionable_error_before_upstream_call(self):
-        r=self.client.post('/api/lab/run',data={'options':json.dumps({'models':[{'model':'qwen3.8-max','base_url':'https://dashscope.aliyuncs.com/compatible-mode/v1','api_key':''}]})})
+        with patch.dict(os.environ, {"DASHSCOPE_API_KEY": ""}):
+            r=self.client.post('/api/lab/run',data={'options':json.dumps({'models':[{'model':'qwen3.8-max','base_url':'https://dashscope.aliyuncs.com/compatible-mode/v1','api_key':''}]})})
         self.assertEqual(r.status_code,400)
         self.assertIn('API Key',r.json()['detail'])
 
