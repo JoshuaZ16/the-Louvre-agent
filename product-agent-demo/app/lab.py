@@ -13,6 +13,7 @@ from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from .config import ModelConfig
+from .evidence import build_packages, legacy_sources, merge_evidence, normalize_records
 
 router = APIRouter(prefix="/api/lab")
 CLAIM_MAX_COUNT = 8
@@ -385,13 +386,14 @@ def sources_from(records):
         seen.add(url)
         host = urlparse(url).hostname or ""
         source_level = str(r.get("source_level") or r.get("kind") or "").lower()
-        trusted = bool(r.get("is_official")) or host.endswith(".gov.cn") or host.endswith(".nifdc.org.cn") or source_level in {"official", "registration", "authority", "官方来源", "监管公开来源"}
+        trusted = not bool(r.get("is_ugc")) and (bool(r.get("is_official")) or host.endswith(".gov.cn") or host.endswith(".nifdc.org.cn") or source_level in {"official", "registration", "authority", "官方来源", "监管公开来源"})
         sources.append({"source_id": f"s{len(sources)+1}", "title": r.get("title") or host,
             "url": url, "domain": host, "snippet": str(r.get("snippet") or r.get("content") or "")[:2500],
-            "kind": "监管公开来源" if trusted else "待核验来源", "trusted": trusted})
+            "kind": source_level or ("监管公开来源" if trusted else "待核验来源"), "trusted": trusted,
+            "is_ugc": bool(r.get("is_ugc")), "trust_basis": [f"provider_label:{source_level}"] if source_level else []})
     return sources[:12]
 
-def validate_report(report, sources, identity=None):
+def validate_report(report, sources, identity=None, evidence_items=None, claim_packages=None):
     if not isinstance(report, dict):
         raise ValueError("模型报告必须是 JSON 对象")
     allowed = {s["source_id"] for s in sources}
@@ -417,6 +419,32 @@ def validate_report(report, sources, identity=None):
         else: gaps.append("一条模型事实缺少监管公开来源，已移出事实卡")
     structured_claims = identity.get("claims_structured", []) if isinstance(identity, dict) else []
     claim_by_id = {str(item.get("claim_id")): item for item in structured_claims if isinstance(item, dict) and item.get("claim_id")}
+    evidence_by_id = {item["evidence_id"]: item for item in (evidence_items or []) if item.get("evidence_id")}
+    linked = {package["claim_id"]: {link["evidence_id"] for link in package.get("candidates", [])}
+              for package in (claim_packages or [])}
+    validated_packages = []
+    for package in (report.get("claim_evidence_packages") if isinstance(report.get("claim_evidence_packages"), list) else []):
+        if not isinstance(package, dict):
+            continue
+        package_id = _text(package.get("claim_id"))
+        if structured_claims and package_id not in claim_by_id:
+            gaps.append(f"证据包引用了不存在的 claim_id：{package_id or '未提供'}")
+            continue
+        candidates = []
+        for candidate in package.get("candidates") if isinstance(package.get("candidates"), list) else []:
+            if not isinstance(candidate, dict):
+                continue
+            evidence_id = _text(candidate.get("evidence_id"))
+            evidence_item = evidence_by_id.get(evidence_id)
+            if not evidence_item:
+                gaps.append(f"证据包引用了不存在的 evidence_id：{evidence_id}")
+                continue
+            source_id = _text(candidate.get("source_id"))
+            if source_id and source_id not in allowed:
+                gaps.append(f"证据包引用了不存在的 source_id：{source_id}")
+                continue
+            candidates.append({**candidate, "claim_id": package_id, "source_id": source_id or evidence_item["source_id"]})
+        validated_packages.append({**package, "claim_id": package_id, "candidates": candidates})
     claim_by_text = {}
     for item in structured_claims:
         text_value = _text(item.get("original_text")) if isinstance(item, dict) else ""
@@ -440,10 +468,22 @@ def validate_report(report, sources, identity=None):
                 continue
             if not claim and claim_id in claim_by_id:
                 claim = _text(claim_by_id[claim_id].get("original_text"), 300)
+        evidence_ids = []
+        for evidence_id in (a.get("evidence_ids") if isinstance(a.get("evidence_ids"), list) else []):
+            evidence_id = _text(evidence_id)
+            item = evidence_by_id.get(evidence_id)
+            if not item or (claim_id and evidence_id not in linked.get(claim_id, set())):
+                gaps.append(f"声明核验引用了不存在或未关联的 evidence_id：{evidence_id}")
+                continue
+            evidence_ids.append(evidence_id)
+            if item["source_id"] not in ids:
+                ids.append(item["source_id"])
         if claim:
             audit = {"claim": claim, "reason": reason, "source_ids": ids, "status": status if any(i in trusted for i in ids) else "待核验"}
             if claim_id:
                 audit["claim_id"] = claim_id
+            if evidence_ids:
+                audit["evidence_ids"] = evidence_ids
             audits.append(audit)
     raw_identity = report.get("product_identity") if isinstance(report.get("product_identity"), dict) else {}
     report_identity = {key: text(raw_identity.get(key), limit) for key, limit in (("brand", 80), ("product_name", 120), ("specification", 80))}
@@ -455,6 +495,8 @@ def validate_report(report, sources, identity=None):
     if structured_claims:
         result["claims_structured"] = structured_claims
         result["claim_coverage"] = (identity or {}).get("claim_coverage", {})
+    if validated_packages:
+        result["claim_evidence_packages"] = validated_packages
     return result
 
 class McpInput(BaseModel):
@@ -514,7 +556,7 @@ async def discover(c: McpInput):
     try: return {"status":"ok", "tools":(await mcp_rpc(c)).get("tools", [])}
     except Exception as exc: return {"status":"error", "error":error_text(exc)}
 
-async def retrieve(raw, query, mcp, search=None, progress=None):
+async def retrieve(raw, query, mcp, search=None, progress=None, records_out=None):
     search = search or {}
     provider = search.get("provider") or ("mcp" if mcp.get("enabled") else "bailian")
     if provider == "tavily":
@@ -525,9 +567,11 @@ async def retrieve(raw, query, mcp, search=None, progress=None):
             response = await client.post("https://api.tavily.com/search",
                 headers={"Authorization": f"Bearer {key}"},
                 json={"query": query, "search_depth": "basic", "max_results": 8,
-                      "include_answer": False, "include_raw_content": False})
+                      "include_answer": False, "include_raw_content": True})
             response.raise_for_status()
-            sources = sources_from(response.json().get("results", []))
+            records = response.json().get("results", [])
+            if records_out is not None: records_out.extend(records)
+            sources = sources_from(records)
             return sources, json.dumps(sources, ensure_ascii=False)
     if provider == "mcp":
         c = McpInput(**mcp)
@@ -542,6 +586,7 @@ async def retrieve(raw, query, mcp, search=None, progress=None):
                 p=json.loads(part)
                 records.extend(p if isinstance(p,list) else p.get("results", []))
             except (ValueError, TypeError, AttributeError): pass
+        if records_out is not None: records_out.extend(records)
         return sources_from(records), "\n".join(parts)[:16000]
     if provider != "bailian":
         raise ValueError("请选择有效的检索服务")
@@ -602,7 +647,34 @@ async def retrieve(raw, query, mcp, search=None, progress=None):
                     for annotation in part.get("annotations", []):
                         citation = annotation.get("url_citation", annotation)
                         if citation.get("url"): records.append(citation)
+        if records_out is not None: records_out.extend(records)
         return sources_from(records), "\n".join(content)[:10000]
+
+
+def collect_initial_claim_evidence(identity, initial_records, initial_sources,
+                                   search=None, mcp=None, search_enabled=True,
+                                   initial_status="ok"):
+    """Build PR1 evidence packages from the shared search result only.
+
+    Supplemental, gap-directed retrieval belongs to the follow-up PR. This
+    function keeps the first PR deterministic and makes the evidence boundary
+    explicit for the review agent.
+    """
+    claims = identity.get("claims_structured", []) if isinstance(identity, dict) else []
+    input_id = identity.get("input_id", "") if isinstance(identity, dict) else ""
+    records = list(initial_records or initial_sources or [])
+    provider = (search or {}).get("provider") or ("mcp" if (mcp or {}).get("enabled") else "bailian")
+    evidence = merge_evidence([], normalize_records(records, provider))
+    packages = build_packages(claims, evidence, input_id)
+    if not search_enabled:
+        status = "disabled"
+    elif initial_status == "error":
+        status = "error"
+    elif evidence:
+        status = "ok"
+    else:
+        status = "empty"
+    return evidence, packages, status
 
 async def run_models(options, image):
     queue=asyncio.Queue()
@@ -665,17 +737,27 @@ async def run_models(options, image):
                 query=f"{identity.get('brand','')} {identity.get('product_name','')} {query}"
             if not query: raise ValueError("请输入产品名称或上传图片")
             sources,evidence=[], ""
+            initial_records=[]
             source_status="disabled"
             if options.get("search_enabled",True):
                 await put("search_started",message="正在获取产品相关官方资料")
                 try:
                     sources,evidence=await retrieve(first,query,options.get("mcp",{}),options.get("search",{}),
-                        progress=lambda message: put("search_progress",message=message))
+                        progress=lambda message: put("search_progress",message=message), records_out=initial_records)
                     source_status="ok" if sources else "empty"
                     await put("sources",sources=sources,message=f"获得 {len(sources)} 条可追溯来源")
                 except Exception as exc:
                     source_status="error"
                     await put("search_error",message=error_text(exc))
+            evidence_items, claim_packages, retrieval_status = collect_initial_claim_evidence(
+                identity, initial_records, sources, options.get("search", {}), options.get("mcp", {}),
+                options.get("search_enabled", True), source_status)
+            if evidence_items:
+                sources = legacy_sources(evidence_items)
+                await put("sources", sources=sources, message=f"获得 {len(sources)} 条可追溯来源")
+            await put("evidence_package_ready", claim_evidence_packages=claim_packages,
+                      evidence_items=evidence_items, retrieval_status=retrieval_status,
+                      message="逐声明候选证据已整理")
             async def generate(raw):
                 begin=time.monotonic()
                 mid=raw.get("id") or raw.get("model")
@@ -694,13 +776,18 @@ async def run_models(options, image):
                         "input_id", "input_type", "batch_detected", "brand", "product_name",
                         "specification", "ocr_text", "confidence", "classification_reason"
                     ) if key in identity}
-                    task_content = json.dumps({
+                    task_data = {
                             "task":query,"input_id":input_id,"image_reading":compact_identity,
                             "claims":identity.get("claims", []),
                             "claims_structured":identity.get("claims_structured", []),
                             "claim_coverage":identity.get("claim_coverage", {}),"sources":sources,
-                            "retrieval_material":evidence,"search_status":source_status,
-                            "input_rule":"单条用户社交媒体内容只能作为用户声明，不可作为官方事实；不要批量复述整篇文案。"},ensure_ascii=False)
+                            "retrieval_material":evidence,"search_status":retrieval_status,
+                            "input_rule":"单条用户社交媒体内容只能作为用户声明，不可作为官方事实；不要批量复述整篇文案。"}
+                    if role == "review":
+                        task_data.update(claim_evidence_packages=claim_packages,
+                                         evidence_items=evidence_items,
+                                         retrieval_status=retrieval_status)
+                    task_content = json.dumps(task_data, ensure_ascii=False)
                     user_content = [{"type":"text","text":task_content}]
                     if image:
                         user_content.insert(0, {"type":"image_url","image_url":{"url":image}})
@@ -737,7 +824,7 @@ async def run_models(options, image):
                         if not stream_completed:
                             raise ValueError("模型流未返回完成标记")
                         try:
-                            parsed=validate_report(parse_json(text),sources,identity)
+                            parsed=validate_report(parse_json(text),sources,identity,evidence_items,claim_packages)
                         except ReportFormatError as initial_error:
                             await put("model_retry",model_id=mid,message="报告格式异常，正在自动修复")
                             repair_prompt = system + "\n修复要求：上一份输出无法解析。现在只返回一个完整、有效的 JSON 对象；不要 Markdown、说明文字、前后缀或第二个 JSON。\n" + REPAIR_REPORT_PROMPT
@@ -748,13 +835,15 @@ async def run_models(options, image):
                                 content=payload.get("choices", [{}])[0].get("message", {}).get("content")
                                 if not isinstance(content, str):
                                     raise ReportFormatError("自动修复未返回文本 JSON 内容")
-                                parsed=validate_report(parse_json(content),sources,identity)
+                                parsed=validate_report(parse_json(content),sources,identity,evidence_items,claim_packages)
                                 request_id = payload.get("id") or request_id
                             except Exception as repair_error:
                                 raise ReportFormatError(
                                     f"初始报告格式错误：{error_text(initial_error)}；自动修复失败：{error_text(repair_error)}") from repair_error
-                    parsed.update(model=mc.model,agent_role=role,agent_name=raw.get("name", mid),request_id=request_id,retrieval_status=source_status,
+                    parsed.update(model=mc.model,agent_role=role,agent_name=raw.get("name", mid),request_id=request_id,retrieval_status=retrieval_status,
                         timing={"first_token_ms":first_token,"generation_ms":round((time.monotonic()-begin)*1000)})
+                    if role == "review":
+                        parsed.update(claim_evidence_packages=claim_packages, evidence_items=evidence_items)
                     await put("report",model_id=mid,report=parsed)
                 except Exception as exc:
                     await put("model_error",model_id=mid,message=error_text(exc),raw_output=text[:12000])

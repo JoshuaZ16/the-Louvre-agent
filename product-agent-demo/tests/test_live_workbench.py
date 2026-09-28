@@ -121,6 +121,19 @@ class WorkbenchLiveTests(unittest.TestCase):
         self.assertIn('不存在的 claim_id', report['evidence_gaps'][0])
         self.assertEqual(report['claim_coverage']['input_id'], 'input-report')
 
+    def test_report_validation_rejects_unknown_evidence_package_ids(self):
+        identity = normalize_identity({'claims': ['声明']}, 'input-package')
+        valid_claim = identity['claims_structured'][0]['claim_id']
+        report = validate_report({
+            'claim_evidence_packages': [{
+                'claim_id': valid_claim,
+                'candidates': [{'evidence_id': 'ev-missing', 'source_id': 's1'}]
+            }]
+        }, [{'source_id': 's1', 'url': 'https://example.com'}], identity,
+            [{'evidence_id': 'ev-real', 'source_id': 's1'}], [])
+        self.assertEqual(report['claim_evidence_packages'][0]['candidates'], [])
+        self.assertTrue(any('evidence_id' in gap for gap in report['evidence_gaps']))
+
     def test_identity_classifier_keeps_one_post_small_and_marks_collage_for_separate_batch_items(self):
         one = normalize_identity({'input_type':'ugc_social_post','batch_detected':False,
                                   'brand':'薇诺娜','product_name':'特护面膜','ocr_text':'x'*3000,
@@ -267,6 +280,8 @@ class WorkbenchLiveTests(unittest.TestCase):
             self.assertEqual(report_task['input_id'], 'input-review')
             self.assertEqual(report_task['claims_structured'][0]['claim_id'], claim_id)
             self.assertEqual(report_task['claim_coverage']['processed_count'], 1)
+            self.assertIn('claim_evidence_packages', report_task)
+            self.assertEqual(report_task['claim_evidence_packages'][0]['claim_id'], claim_id)
             self.assertNotIn('claims_structured', report_task['image_reading'])
         asyncio.run(scenario())
 

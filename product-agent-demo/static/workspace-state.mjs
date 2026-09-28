@@ -7,7 +7,7 @@ export const agentDefinitions={
  review:{name:'声明核验 Agent',icon:'check-square',description:'核对包装声明与检索证据'},
  visual:{name:'图片核查 Agent',icon:'image',description:'检查包装文字与可见图片信息'}
 };
-export function emptyRun(){return {identity:null,input_type:'',batch_detected:false,sources:[],report:null,reports:{},agents:Object.fromEntries(Object.keys(agentDefinitions).map(id=>[id,{status:'idle',message:'等待共享识别与检索材料',draft:'',report:null}])),draft:'',error:'',elapsed:0,stages:{identify:{status:'idle',message:'等待图片识别'},search:{status:'idle',message:'识别产品后检索相关资料'},report:{status:'idle',message:'三个 Agent 等待共享材料'}}};}
+export function emptyRun(){return {identity:null,input_type:'',batch_detected:false,sources:[],evidence_items:[],claim_evidence_packages:[],retrieval_status:'disabled',report:null,reports:{},agents:Object.fromEntries(Object.keys(agentDefinitions).map(id=>[id,{status:'idle',message:'等待共享识别与检索材料',draft:'',report:null}])),draft:'',error:'',elapsed:0,stages:{identify:{status:'idle',message:'等待图片识别'},search:{status:'idle',message:'识别产品后检索相关资料'},report:{status:'idle',message:'三个 Agent 等待共享材料'}}};}
 export function batchProgress(items){const runs=items.map(item=>item?.run||emptyRun());const partialFailure=r=>!!r.error||Object.values(r.agents||{}).some(a=>a.status==='error');const finished=runs.filter(r=>['done','error','attention','cancelled'].includes(r.stages.report.status)||partialFailure(r)).length;const successful=runs.filter(r=>r.report&&r.stages.report.status==='done'&&!partialFailure(r)).length;return {total:runs.length,finished,successful,failed:Math.max(0,finished-successful)};}
 export function reduceRun(previous,event){
  const r={...previous,reports:{...previous.reports},agents:structuredClone(previous.agents),stages:structuredClone(previous.stages)};
@@ -21,6 +21,7 @@ export function reduceRun(previous,event){
   case 'search_started':set('search','running',event.message);break;
   case 'search_progress':if(r.stages.search.status==='running')r.stages.search.message=event.message;break;
   case 'sources':r.sources=event.sources||[];set('search','done',r.sources.length?`已返回 ${r.sources.length} 个资料来源`:'未检索到可追溯来源');break;
+  case 'evidence_package_ready':r.evidence_items=event.evidence_items||[];r.claim_evidence_packages=event.claim_evidence_packages||[];r.retrieval_status=event.retrieval_status||'disabled';break;
   case 'search_error':set('search','error',event.message);break;
   case 'model_started':
    if(r.stages.identify.status==='idle')set('identify','done','使用提供的产品名称');
@@ -32,7 +33,8 @@ export function reduceRun(previous,event){
   case 'report':{
    Object.assign(agent(),{status:'done',message:'分析完成',report:event.report});r.reports[id]=event.report;
    const reports=Object.values(r.reports);
-   r.report={summary:reports.map(p=>`${p.agent_name||''}：${p.summary||''}`).join('\n'),official_facts:reports.flatMap(p=>p.official_facts||[]),claim_evidence_audit:reports.flatMap(p=>p.claim_evidence_audit||[]),image_observations:reports.flatMap(p=>p.image_observations||[]),evidence_gaps:[...new Set(reports.flatMap(p=>p.evidence_gaps||[]))],sources:r.sources};
+   const review=reports.find(p=>p.agent_role==='review' || p.claim_evidence_packages);
+   r.report={summary:reports.map(p=>`${p.agent_name||''}：${p.summary||''}`).join('\n'),official_facts:reports.flatMap(p=>p.official_facts||[]),claim_evidence_audit:reports.flatMap(p=>p.claim_evidence_audit||[]),image_observations:reports.flatMap(p=>p.image_observations||[]),evidence_gaps:[...new Set(reports.flatMap(p=>p.evidence_gaps||[]))],sources:r.sources,claim_evidence_packages:review?.claim_evidence_packages||r.claim_evidence_packages,evidence_items:review?.evidence_items||r.evidence_items,retrieval_status:review?.retrieval_status||r.retrieval_status};
    if(Object.values(r.agents).every(a=>['done','error','cancelled'].includes(a.status)))set('report','done','智能体分析已返回');
    break;
   }
