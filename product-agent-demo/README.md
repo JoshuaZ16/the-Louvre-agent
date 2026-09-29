@@ -20,6 +20,7 @@ uvicorn app.main:app --reload --port 8000
 ## 结构
 
 - `app/lab.py`：三 Agent 并行识别、声明核验、图片核查、流式检索和结构化报告。
+- `app/evidence.py`：统一检索来源，并按 `claim_id` 建立可追溯的候选证据包。
 - `app/model_client.py`：DashScope/Qwen 兼容接口调用。
 - `app/mcp_client.py`：Streamable HTTP MCP 调用边界，支持百炼官方/自定义 MCP。
 - `app/orchestrator.py`：产品识别、证据检索、报告生成的事件编排。
@@ -82,7 +83,13 @@ uvicorn app.main:app --reload --port 8000
 }
 ```
 
-OCR 不清晰或字段无法确认时，声明会进入 `partially_parsed` 或 `unparsed`，并在 `uncertainty_reasons` 中说明原因；不会补写确定数值。该契约只负责声明解析和追踪，证据检索与最终支持判定仍属于后续 2B/2C。
+OCR 不清晰或字段无法确认时，声明会进入 `partially_parsed` 或 `unparsed`，并在 `uncertainty_reasons` 中说明原因；不会补写确定数值。该契约只负责声明解析和追踪；证据归一化与候选证据关联属于 2B，最终支持判定仍属于 2C。
+
+## 逐声明候选证据（2B PR1）
+
+检索完成后，工作台会复用共享检索结果，为每条 `claims_structured` 生成一个 `claim_evidence_packages` 项。每个候选会记录 `evidence_id`、来源、产品匹配状态、原文相关性、已覆盖/未覆盖条件和关联原因。候选证据不等同于声明已经获得支持。
+
+证据对象保留来源类型、发布主体、可信依据、UGC 标记、获取时间、原文片段、片段定位、内容指纹、产品规格/版本和实验条件。完整正文、提供方摘要和只有 URL 的结果会分别标记；只有实际获取到的正文或片段才作为原文引用。官方标记只作为待验证元数据，不能单独提升可信度；UGC 与官方标记冲突时保守处理。
 
 运行测试（在 `product-agent-demo` 目录内）：
 
