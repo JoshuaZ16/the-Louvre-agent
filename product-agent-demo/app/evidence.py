@@ -238,3 +238,15 @@ def build_packages(claims, evidence, input_id):
         packages.append({"claim_id": claim_id, "input_id": input_id, "candidates": links,
                          "gaps": list(dict.fromkeys(gaps)), "retrieval_events": []})
     return packages
+
+
+def followup_query(claim, gaps):
+    if not gaps:
+        return ""
+    product = claim.get("product_context") or {}
+    pieces = [product.get("brand"), product.get("product_name"), product.get("specification"),
+              product.get("version"), claim.get("normalized_text") or claim.get("original_text")]
+    conditions = claim.get("conditions") or {}
+    pieces.extend(_condition_text(conditions.get(key)) for key in CONDITION_KEYS if key in gaps)
+    pieces.extend(_condition_text(conditions.get("endorsements")) for _ in [0] if "endorsements" in gaps)
+    return " ".join(dict.fromkeys(_text(piece) for piece in pieces if _text(piece)))[:350]
