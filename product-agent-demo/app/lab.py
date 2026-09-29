@@ -13,7 +13,7 @@ from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from .config import ModelConfig
-from .evidence import build_packages, legacy_sources, merge_evidence, normalize_records
+from .evidence import build_packages, followup_query, legacy_sources, merge_evidence, normalize_records
 
 router = APIRouter(prefix="/api/lab")
 CLAIM_MAX_COUNT = 8
@@ -654,31 +654,133 @@ async def retrieve(raw, query, mcp, search=None, progress=None, records_out=None
         if records_out is not None: records_out.extend(records)
         return sources_from(records), "\n".join(content)[:10000]
 
-
-def collect_initial_claim_evidence(identity, initial_records, initial_sources,
-                                   search=None, mcp=None, search_enabled=True,
-                                   initial_status="ok"):
-    """Build PR1 evidence packages from the shared search result only.
-
-    Supplemental, gap-directed retrieval belongs to the follow-up PR. This
-    function keeps the first PR deterministic and makes the evidence boundary
-    explicit for the review agent.
-    """
-    claims = identity.get("claims_structured", []) if isinstance(identity, dict) else []
-    input_id = identity.get("input_id", "") if isinstance(identity, dict) else ""
-    records = list(initial_records or initial_sources or [])
+async def collect_claim_evidence(identity, raw, mcp, search, initial_records, initial_sources,
+                                 search_enabled=True, initial_status="ok", progress=None):
+    """Match shared results, then perform only bounded, gap-directed searches."""
+    claims = identity.get("claims_structured", [])
+    input_id = identity.get("input_id", "")
     provider = (search or {}).get("provider") or ("mcp" if (mcp or {}).get("enabled") else "bailian")
+    records = list(initial_records or initial_sources or [])
     evidence = merge_evidence([], normalize_records(records, provider))
     packages = build_packages(claims, evidence, input_id)
-    if not search_enabled:
-        status = "disabled"
-    elif initial_status == "error":
-        status = "error"
-    elif evidence:
-        status = "ok"
+    budget = {"max_per_claim": 1, "max_extra_calls": 4, "max_concurrency": 2,
+              "total_timeout_seconds": 30, "call_timeout_seconds": 15, "max_retries_per_query": 1,
+              "calls_used": 0, "queries_used": 0, "retries_used": 0, "cancelled_queries": 0}
+    if not search_enabled or not claims:
+        return evidence, packages, budget, "disabled" if not search_enabled else initial_status
+
+    claim_by_id = {claim["claim_id"]: claim for claim in claims}
+    query_groups = {}
+    for package in packages:
+        if not package["gaps"]:
+            continue
+        claim = claim_by_id[package["claim_id"]]
+        query = followup_query(claim, package["gaps"])
+        if query:
+            query_groups.setdefault(query, []).append(package["claim_id"])
+
+    scheduled = list(query_groups.items())[:budget["max_extra_calls"]]
+    skipped = list(query_groups.items())[budget["max_extra_calls"]:]
+    events_by_claim = {claim_id: [] for claim_id in claim_by_id}
+    if initial_status == "error":
+        for claim_id in events_by_claim:
+            events_by_claim[claim_id].append("provider_error")
+    for _, claim_ids in skipped:
+        for claim_id in claim_ids:
+            events_by_claim[claim_id].append("budget_exhausted")
+    if not scheduled:
+        for package in packages:
+            package["retrieval_events"] = events_by_claim[package["claim_id"]]
+        return evidence, packages, budget, "empty" if not evidence and initial_status == "ok" else initial_status
+
+    started = time.monotonic()
+    lock = asyncio.Lock()
+    semaphore = asyncio.Semaphore(budget["max_concurrency"])
+
+    async def run_query(query, claim_ids):
+        async with semaphore:
+            for attempt in range(2):
+                remaining = budget["total_timeout_seconds"] - (time.monotonic() - started)
+                if remaining <= 0:
+                    return [], claim_ids, "timeout"
+                async with lock:
+                    if budget["calls_used"] >= budget["max_extra_calls"]:
+                        return [], claim_ids, "budget_exhausted"
+                    budget["calls_used"] += 1
+                    if attempt:
+                        budget["retries_used"] += 1
+                    else:
+                        budget["queries_used"] += 1
+                found = []
+                try:
+                    if progress:
+                        value = progress("正在补查声明缺口")
+                        if hasattr(value, "__await__"): await value
+                    sources, _ = await asyncio.wait_for(
+                        retrieve(raw, query, mcp, search, records_out=found),
+                        timeout=min(budget["call_timeout_seconds"], remaining))
+                    return found or sources, claim_ids, "ok" if found or sources else "no_result"
+                except (asyncio.TimeoutError, httpx.TimeoutException):
+                    failure = "timeout"
+                except Exception:
+                    failure = "provider_error"
+                if attempt == 1:
+                    return [], claim_ids, failure
+            return [], claim_ids, "provider_error"
+
+    tasks = [asyncio.create_task(run_query(query, ids)) for query, ids in scheduled]
+    was_cancelled = False
+    try:
+        done, pending = await asyncio.wait(tasks, timeout=budget["total_timeout_seconds"])
+    except asyncio.CancelledError:
+        # A client disconnect can cancel the parent task. Keep completed
+        # queries and turn only unfinished work into auditable cancellation
+        # events before returning the partial evidence package.
+        was_cancelled = True
+        done = {task for task in tasks if task.done()}
+        pending = {task for task in tasks if not task.done()}
+    for task in pending:
+        task.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+    additions = []
+    for task in done:
+        if task.cancelled():
+            continue
+        try:
+            found, claim_ids, status = task.result()
+        except asyncio.CancelledError:
+            continue
+        if found:
+            additions.extend(normalize_records(found, provider))
+        if status != "ok":
+            for claim_id in claim_ids:
+                events_by_claim[claim_id].append(status)
+    for task, (_, claim_ids) in zip(tasks, scheduled):
+        if task in pending:
+            for claim_id in claim_ids:
+                event = "cancelled" if was_cancelled else "timeout"
+                events_by_claim[claim_id].append(event)
+            if was_cancelled:
+                budget["cancelled_queries"] += 1
+        elif task.cancelled() and was_cancelled:
+            for claim_id in claim_ids:
+                events_by_claim[claim_id].append("cancelled")
+            budget["cancelled_queries"] += 1
+    evidence = merge_evidence(evidence, additions)
+    packages = build_packages(claims, evidence, input_id)
+    for package in packages:
+        package["retrieval_events"] = events_by_claim[package["claim_id"]]
+        package["gaps"] = list(dict.fromkeys(package["gaps"] + package["retrieval_events"]))
+    if was_cancelled:
+        status = "cancelled"
+    elif not evidence:
+        status = "timeout" if pending else "error" if initial_status == "error" else "empty"
+    elif pending or any(events_by_claim.values()) or initial_status == "error":
+        status = "partial"
     else:
-        status = "empty"
-    return evidence, packages, status
+        status = "ok"
+    return evidence, packages, budget, status
 
 async def run_models(options, image):
     queue=asyncio.Queue()
@@ -753,15 +855,16 @@ async def run_models(options, image):
                 except Exception as exc:
                     source_status="error"
                     await put("search_error",message=error_text(exc))
-            evidence_items, claim_packages, retrieval_status = collect_initial_claim_evidence(
-                identity, initial_records, sources, options.get("search", {}), options.get("mcp", {}),
-                options.get("search_enabled", True), source_status)
+            evidence_items, claim_packages, retrieval_budget, retrieval_status = await collect_claim_evidence(
+                identity, first, options.get("mcp", {}), options.get("search", {}), initial_records, sources,
+                search_enabled=options.get("search_enabled", True), initial_status=source_status,
+                progress=lambda message: put("search_progress", message=message))
             if evidence_items:
                 sources = legacy_sources(evidence_items)
                 await put("sources", sources=sources, message=f"获得 {len(sources)} 条可追溯来源")
             await put("evidence_package_ready", claim_evidence_packages=claim_packages,
-                      evidence_items=evidence_items, retrieval_status=retrieval_status,
-                      message="逐声明候选证据已整理")
+                      evidence_items=evidence_items, retrieval_budget=retrieval_budget,
+                      retrieval_status=retrieval_status, message="逐声明候选证据已整理")
             async def generate(raw):
                 begin=time.monotonic()
                 mid=raw.get("id") or raw.get("model")
@@ -790,6 +893,7 @@ async def run_models(options, image):
                     if role == "review":
                         task_data.update(claim_evidence_packages=claim_packages,
                                          evidence_items=evidence_items,
+                                         retrieval_budget=retrieval_budget,
                                          retrieval_status=retrieval_status)
                     task_content = json.dumps(task_data, ensure_ascii=False)
                     user_content = [{"type":"text","text":task_content}]
@@ -847,7 +951,8 @@ async def run_models(options, image):
                     parsed.update(model=mc.model,agent_role=role,agent_name=raw.get("name", mid),request_id=request_id,retrieval_status=retrieval_status,
                         timing={"first_token_ms":first_token,"generation_ms":round((time.monotonic()-begin)*1000)})
                     if role == "review":
-                        parsed.update(claim_evidence_packages=claim_packages, evidence_items=evidence_items)
+                        parsed.update(claim_evidence_packages=claim_packages, evidence_items=evidence_items,
+                                      retrieval_budget=retrieval_budget)
                     await put("report",model_id=mid,report=parsed)
                 except Exception as exc:
                     await put("model_error",model_id=mid,message=error_text(exc),raw_output=text[:12000])
