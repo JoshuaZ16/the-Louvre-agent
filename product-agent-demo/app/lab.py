@@ -439,11 +439,15 @@ def validate_report(report, sources, identity=None, evidence_items=None, claim_p
             if not evidence_item:
                 gaps.append(f"证据包引用了不存在的 evidence_id：{evidence_id}")
                 continue
-            source_id = _text(candidate.get("source_id"))
-            if source_id and source_id not in allowed:
-                gaps.append(f"证据包引用了不存在的 source_id：{source_id}")
+            evidence_source_id = _text(evidence_item.get("source_id"))
+            if evidence_source_id not in allowed:
+                gaps.append(f"证据项引用了不存在的 source_id：{evidence_source_id or '未提供'}")
                 continue
-            candidates.append({**candidate, "claim_id": package_id, "source_id": source_id or evidence_item["source_id"]})
+            source_id = _text(candidate.get("source_id"))
+            if source_id and source_id != evidence_source_id:
+                gaps.append(f"证据包的 evidence_id 与 source_id 不匹配：{evidence_id}")
+                continue
+            candidates.append({**candidate, "claim_id": package_id, "source_id": evidence_source_id})
         validated_packages.append({**package, "claim_id": package_id, "candidates": candidates})
     claim_by_text = {}
     for item in structured_claims:

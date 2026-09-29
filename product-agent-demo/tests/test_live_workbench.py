@@ -134,6 +134,23 @@ class WorkbenchLiveTests(unittest.TestCase):
         self.assertEqual(report['claim_evidence_packages'][0]['candidates'], [])
         self.assertTrue(any('evidence_id' in gap for gap in report['evidence_gaps']))
 
+    def test_report_validation_rejects_mismatched_evidence_and_source_ids(self):
+        identity = normalize_identity({'claims': ['声明']}, 'input-package-source-mismatch')
+        valid_claim = identity['claims_structured'][0]['claim_id']
+        report = validate_report({
+            'claim_evidence_packages': [{
+                'claim_id': valid_claim,
+                'candidates': [{'evidence_id': 'ev-real', 'source_id': 's1'}]
+            }]
+        }, [
+            {'source_id': 's1', 'url': 'https://example.com/one'},
+            {'source_id': 's2', 'url': 'https://example.com/two'},
+        ], identity,
+            [{'evidence_id': 'ev-real', 'source_id': 's2'}],
+            [{'claim_id': valid_claim, 'candidates': [{'evidence_id': 'ev-real'}]}])
+        self.assertEqual(report['claim_evidence_packages'][0]['candidates'], [])
+        self.assertTrue(any('source_id' in gap for gap in report['evidence_gaps']))
+
     def test_identity_classifier_keeps_one_post_small_and_marks_collage_for_separate_batch_items(self):
         one = normalize_identity({'input_type':'ugc_social_post','batch_detected':False,
                                   'brand':'薇诺娜','product_name':'特护面膜','ocr_text':'x'*3000,
