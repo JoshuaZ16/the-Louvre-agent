@@ -865,6 +865,9 @@ async def run_models(options, image):
             await put("evidence_package_ready", claim_evidence_packages=claim_packages,
                       evidence_items=evidence_items, retrieval_budget=retrieval_budget,
                       retrieval_status=retrieval_status, message="逐声明候选证据已整理")
+            if retrieval_status == "cancelled":
+                await put("cancelled", message="已取消补充检索，保留已完成的证据")
+                return
             async def generate(raw):
                 begin=time.monotonic()
                 mid=raw.get("id") or raw.get("model")

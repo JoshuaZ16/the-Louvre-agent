@@ -484,6 +484,35 @@ class WorkbenchLiveTests(unittest.TestCase):
         self.assertEqual(packages[1]['retrieval_events'], ['cancelled'])
         self.assertEqual(len(packages[0]['candidates']), 1)
 
+    def test_run_models_stops_before_report_generation_after_retrieval_cancel(self):
+        async def cancelled_collect(*args, **kwargs):
+            return [], [], {'calls_used': 1}, 'cancelled'
+
+        async def empty_retrieve(*args, **kwargs):
+            return [], ''
+
+        async def scenario():
+            model_requests = []
+            async def handler(request):
+                model_requests.append(request)
+                return httpx.Response(500, text='report generation should not start')
+            real = httpx.AsyncClient
+            with patch('app.lab.retrieve', side_effect=empty_retrieve), \
+                    patch('app.lab.collect_claim_evidence', side_effect=cancelled_collect), \
+                    patch('app.lab.httpx.AsyncClient', side_effect=lambda **kw: real(transport=httpx.MockTransport(handler), **kw)):
+                events = [json.loads(s.removeprefix('data: ')) async for s in run_models({
+                    'models': [{'id': 'review', 'agent_role': 'review', 'model': 'review-model',
+                                'base_url': 'https://model.example/v1', 'api_key': 'x'}],
+                    'query': 'product', 'search_enabled': True,
+                }, None)]
+            return events, model_requests
+
+        events, model_requests = asyncio.run(scenario())
+        self.assertEqual(model_requests, [])
+        self.assertEqual([event['type'] for event in events], [
+            'started', 'search_started', 'sources', 'evidence_package_ready', 'cancelled'
+        ])
+
     def test_bailian_report_stream_uses_json_mode_but_custom_endpoint_does_not(self):
         async def collect(base_url):
             bodies=[]
