@@ -13,7 +13,7 @@ import httpx
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from .claim_review import adjudicate_claims, build_review_summary
+from .claim_review import adjudicate_claims, build_review_summary, review_context
 from .config import ModelConfig
 from .evidence import build_packages, followup_query, legacy_sources, merge_evidence, normalize_records
 
@@ -960,6 +960,7 @@ async def run_models(options, image):
                         system += "\n额外可输出 image_observations 数组，描述图片可见事实；不要编造图片区域或来源。"
                     if role == "review":
                         system += "\n逐声明输出务必紧凑：每个 claim_id 最多一条结果，每条最多一条支持证据和一条反对证据；quote 最多60字。无法确认的证据使用空数组，勿重复引文或字段。"
+                        system += "\n证据包的 related 只表示同系列或声明子命题相关；若原文确实支持其中一部分，可提交 relation=partial、逐字引文和受支持的子命题，不能把它升级为完整产品功效。"
                     if raw.get("instructions"):
                         system += "\n本智能体补充要求：" + str(raw["instructions"])
                     if options.get("skill_enabled",True): system+="\n工作约束：\n"+options.get("skill",SKILL_DEFAULT)
@@ -975,8 +976,13 @@ async def run_models(options, image):
                             "retrieval_material":evidence,"search_status":retrieval_status,
                             "input_rule":"单条用户社交媒体内容只能作为用户声明，不可作为官方事实；不要批量复述整篇文案。"}
                     if role == "review":
-                        task_data.update(claim_evidence_packages=claim_packages,
-                                         evidence_items=evidence_items,
+                        visible_packages, visible_items = review_context(
+                            identity.get("claims_structured", []), evidence_items, claim_packages)
+                        task_data["sources"] = [{"source_id": item["source_id"], "url": item["url"],
+                                                "title": item["title"]} for item in visible_items]
+                        task_data["retrieval_material"] = ""
+                        task_data.update(claim_evidence_packages=visible_packages,
+                                         evidence_items=visible_items,
                                          retrieval_budget=retrieval_budget,
                                          retrieval_status=retrieval_status)
                     task_content = json.dumps(task_data, ensure_ascii=False)
