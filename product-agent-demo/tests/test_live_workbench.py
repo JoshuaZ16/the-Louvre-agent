@@ -401,6 +401,30 @@ class WorkbenchLiveTests(unittest.TestCase):
             self.assertGreater(report_requests[1]['max_tokens'],report_requests[0]['max_tokens'])
         asyncio.run(scenario())
 
+    def test_cancelled_followups_keep_completed_evidence_and_mark_pending_claims(self):
+        identity = normalize_identity({'brand':'Brand','product_name':'Cream','confidence':.92,
+                                       'claims':['声明一','声明二']}, 'input-cancel')
+        async def scenario():
+            started = asyncio.Event(); completed = asyncio.Event(); release = asyncio.Event()
+            async def search(*args, **kwargs):
+                if '声明一' in args[1]:
+                    record={'url':'https://source.example/completed','title':'Completed',
+                            'raw_content':'声明一','brand':'Brand','product_name':'Cream'}
+                    kwargs['records_out'].append(record); completed.set()
+                    return ([record], record['raw_content'])
+                started.set(); await release.wait(); return ([], '')
+            with patch('app.lab.retrieve', side_effect=search):
+                task=asyncio.create_task(collect_claim_evidence(
+                    identity, {'base_url':'https://model.example/v1','api_key':'x','model':'m'}, {},
+                    {'provider':'tavily','api_key':'x'}, [], [], search_enabled=True))
+                await started.wait(); await completed.wait(); task.cancel()
+                return await task
+        evidence, packages, budget, status = asyncio.run(scenario())
+        self.assertEqual(len(evidence), 1)
+        self.assertEqual(status, 'cancelled')
+        self.assertEqual(budget['cancelled_queries'], 1)
+        self.assertEqual(packages[1]['retrieval_events'], ['cancelled'])
+
     def test_failed_format_repair_only_fails_the_affected_agent(self):
         async def scenario():
             requests=[]

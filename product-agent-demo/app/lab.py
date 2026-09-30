@@ -452,10 +452,14 @@ def validate_report(report, sources, identity=None, evidence_items=None, claim_p
                 gaps.append(f"证据包引用了不存在的 evidence_id：{evidence_id}")
                 continue
             source_id = _text(candidate.get("source_id"))
-            if source_id and source_id not in allowed:
-                gaps.append(f"证据包引用了不存在的 source_id：{source_id}")
+            evidence_source_id = _text(evidence_item.get("source_id"))
+            if evidence_source_id not in allowed:
+                gaps.append(f"证据项引用了不存在的 source_id：{evidence_source_id or '未提供'}")
                 continue
-            candidates.append({**candidate, "claim_id": package_id, "source_id": source_id or evidence_item["source_id"]})
+            if source_id and source_id != evidence_source_id:
+                gaps.append(f"证据包的 evidence_id 与 source_id 不匹配：{evidence_id}")
+                continue
+            candidates.append({**candidate, "claim_id": package_id, "source_id": evidence_source_id})
         validated_packages.append({**package, "claim_id": package_id, "candidates": candidates})
     claim_by_text = {}
     for item in structured_claims:
@@ -685,7 +689,7 @@ async def collect_claim_evidence(identity, raw, mcp, search, initial_records, in
     packages = build_packages(claims, evidence, input_id)
     budget = {"max_per_claim": 1, "max_extra_calls": 4, "max_concurrency": 2,
               "total_timeout_seconds": 30, "call_timeout_seconds": 15, "max_retries_per_query": 1,
-              "calls_used": 0, "queries_used": 0, "retries_used": 0}
+              "calls_used": 0, "queries_used": 0, "retries_used": 0, "cancelled_queries": 0}
     if not search_enabled or not claims:
         return evidence, packages, budget, "disabled" if not search_enabled else initial_status
 
@@ -749,14 +753,25 @@ async def collect_claim_evidence(identity, raw, mcp, search, initial_records, in
             return [], claim_ids, "provider_error"
 
     tasks = [asyncio.create_task(run_query(query, ids)) for query, ids in scheduled]
-    done, pending = await asyncio.wait(tasks, timeout=budget["total_timeout_seconds"])
+    was_cancelled = False
+    try:
+        done, pending = await asyncio.wait(tasks, timeout=budget["total_timeout_seconds"])
+    except asyncio.CancelledError:
+        was_cancelled = True
+        done = {task for task in tasks if task.done()}
+        pending = {task for task in tasks if not task.done()}
     for task in pending:
         task.cancel()
     if pending:
         await asyncio.gather(*pending, return_exceptions=True)
     additions = []
     for task in done:
-        found, claim_ids, status = task.result()
+        if task.cancelled():
+            continue
+        try:
+            found, claim_ids, status = task.result()
+        except asyncio.CancelledError:
+            continue
         if found:
             additions.extend(normalize_records(found, provider))
         if status != "ok":
@@ -765,13 +780,21 @@ async def collect_claim_evidence(identity, raw, mcp, search, initial_records, in
     for task, (_, claim_ids) in zip(tasks, scheduled):
         if task in pending:
             for claim_id in claim_ids:
-                events_by_claim[claim_id].append("timeout")
+                events_by_claim[claim_id].append("cancelled" if was_cancelled else "timeout")
+            if was_cancelled:
+                budget["cancelled_queries"] += 1
+        elif task.cancelled() and was_cancelled:
+            for claim_id in claim_ids:
+                events_by_claim[claim_id].append("cancelled")
+            budget["cancelled_queries"] += 1
     evidence = merge_evidence(evidence, additions)
     packages = build_packages(claims, evidence, input_id)
     for package in packages:
         package["retrieval_events"] = events_by_claim[package["claim_id"]]
         package["gaps"] = list(dict.fromkeys(package["gaps"] + package["retrieval_events"]))
-    if not evidence:
+    if was_cancelled:
+        status = "cancelled"
+    elif not evidence:
         status = "timeout" if pending else "error" if initial_status == "error" else "empty"
     elif pending or any(events_by_claim.values()) or initial_status == "error":
         status = "partial"
@@ -862,6 +885,9 @@ async def run_models(options, image):
             await put("evidence_package_ready", claim_evidence_packages=claim_packages,
                       evidence_items=evidence_items, retrieval_budget=retrieval_budget,
                       retrieval_status=retrieval_status, message="逐声明候选证据已整理")
+            if retrieval_status == "cancelled":
+                await put("cancelled", message="已取消补充检索，保留已完成的证据")
+                return
             async def generate(raw):
                 begin=time.monotonic()
                 mid=raw.get("id") or raw.get("model")
