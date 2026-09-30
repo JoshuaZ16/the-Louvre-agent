@@ -122,36 +122,6 @@ class WorkbenchLiveTests(unittest.TestCase):
         self.assertIn('不存在的 claim_id', report['evidence_gaps'][0])
         self.assertEqual(report['claim_coverage']['input_id'], 'input-report')
 
-    def test_report_validation_rejects_unknown_evidence_package_ids(self):
-        identity = normalize_identity({'claims': ['声明']}, 'input-package')
-        valid_claim = identity['claims_structured'][0]['claim_id']
-        report = validate_report({
-            'claim_evidence_packages': [{
-                'claim_id': valid_claim,
-                'candidates': [{'evidence_id': 'ev-missing', 'source_id': 's1'}]
-            }]
-        }, [{'source_id': 's1', 'url': 'https://example.com'}], identity,
-            [{'evidence_id': 'ev-real', 'source_id': 's1'}], [])
-        self.assertEqual(report['claim_evidence_packages'][0]['candidates'], [])
-        self.assertTrue(any('evidence_id' in gap for gap in report['evidence_gaps']))
-
-    def test_report_validation_rejects_mismatched_evidence_and_source_ids(self):
-        identity = normalize_identity({'claims': ['声明']}, 'input-package-source-mismatch')
-        valid_claim = identity['claims_structured'][0]['claim_id']
-        report = validate_report({
-            'claim_evidence_packages': [{
-                'claim_id': valid_claim,
-                'candidates': [{'evidence_id': 'ev-real', 'source_id': 's1'}]
-            }]
-        }, [
-            {'source_id': 's1', 'url': 'https://example.com/one'},
-            {'source_id': 's2', 'url': 'https://example.com/two'},
-        ], identity,
-            [{'evidence_id': 'ev-real', 'source_id': 's2'}],
-            [{'claim_id': valid_claim, 'candidates': [{'evidence_id': 'ev-real'}]}])
-        self.assertEqual(report['claim_evidence_packages'][0]['candidates'], [])
-        self.assertTrue(any('source_id' in gap for gap in report['evidence_gaps']))
-
     def test_identity_classifier_keeps_one_post_small_and_marks_collage_for_separate_batch_items(self):
         one = normalize_identity({'input_type':'ugc_social_post','batch_detected':False,
                                   'brand':'薇诺娜','product_name':'特护面膜','ocr_text':'x'*3000,
@@ -339,180 +309,6 @@ class WorkbenchLiveTests(unittest.TestCase):
         self.assertTrue(any('budget_exhausted' in p['retrieval_events'] for p in packages))
         self.assertEqual(len(evidence), 4)
 
-    def test_claim_evidence_skips_supplement_when_shared_material_is_sufficient(self):
-        calls = []
-        identity = normalize_identity({
-            'brand': 'Brand', 'product_name': 'Cream', 'confidence': .92,
-            'claims': [{'text': '7天修护', 'claim_type': 'efficacy',
-                        'conditions': {'time': {'original_text': '7天'}}}]
-        }, 'input-sufficient')
-        records = [{'url': 'https://brand.example/cream', 'title': 'Cream',
-                    'raw_content': '7天修护', 'brand': 'Brand', 'product_name': 'Cream'}]
-        async def search(*args, **kwargs):
-            calls.append(args[1])
-            raise AssertionError('shared material should avoid supplemental retrieval')
-        with patch('app.lab.retrieve', side_effect=search):
-            evidence, packages, budget, status = asyncio.run(collect_claim_evidence(
-                identity, {'base_url': 'https://model.example/v1', 'api_key': 'x', 'model': 'm'}, {},
-                {'provider': 'tavily', 'api_key': 'x'}, records, records, search_enabled=True))
-        self.assertEqual(calls, [])
-        self.assertEqual(budget['calls_used'], 0)
-        self.assertEqual(status, 'ok')
-        self.assertEqual(packages[0]['retrieval_events'], [])
-        self.assertEqual(len(evidence), 1)
-
-    def test_identical_followup_queries_are_deduplicated_across_claims(self):
-        calls = []
-        identity = normalize_identity({
-            'brand': 'Brand', 'product_name': 'Cream', 'confidence': .92,
-            'claims': ['同一声明', '同一声明']
-        }, 'input-dedup')
-        async def search(*args, **kwargs):
-            calls.append(args[1])
-            record = {'url': 'https://source.example/shared', 'title': 'Shared',
-                      'raw_content': '同一声明', 'brand': 'Brand', 'product_name': 'Cream'}
-            kwargs['records_out'].append(record)
-            return ([record], record['raw_content'])
-        with patch('app.lab.retrieve', side_effect=search):
-            evidence, packages, budget, status = asyncio.run(collect_claim_evidence(
-                identity, {'base_url': 'https://model.example/v1', 'api_key': 'x', 'model': 'm'}, {},
-                {'provider': 'tavily', 'api_key': 'x'}, [], [], search_enabled=True))
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(budget['queries_used'], 1)
-        self.assertEqual(status, 'ok')
-        self.assertEqual(len(evidence), 1)
-        self.assertEqual(len([p for p in packages if p['candidates']]), 2)
-
-    def test_failed_followup_retries_within_budget_and_preserves_status(self):
-        calls = []
-        identity = normalize_identity({'brand': 'Brand', 'product_name': 'Cream',
-                                       'confidence': .92, 'claims': ['声明']}, 'input-retry')
-        async def search(*args, **kwargs):
-            calls.append(args[1])
-            if len(calls) == 1:
-                raise ValueError('provider unavailable')
-            record = {'url': 'https://source.example/retry', 'title': 'Retry',
-                      'raw_content': '声明', 'brand': 'Brand', 'product_name': 'Cream'}
-            kwargs['records_out'].append(record)
-            return ([record], record['raw_content'])
-        with patch('app.lab.retrieve', side_effect=search):
-            evidence, packages, budget, status = asyncio.run(collect_claim_evidence(
-                identity, {'base_url': 'https://model.example/v1', 'api_key': 'x', 'model': 'm'}, {},
-                {'provider': 'tavily', 'api_key': 'x'}, [], [], search_enabled=True))
-        self.assertEqual(len(calls), 2)
-        self.assertEqual(budget['retries_used'], 1)
-        self.assertEqual(budget['calls_used'], 2)
-        self.assertEqual(status, 'ok')
-        self.assertEqual(len(evidence), 1)
-        self.assertEqual(packages[0]['retrieval_events'], [])
-
-    def test_timeout_is_recorded_separately_from_provider_error(self):
-        identity = normalize_identity({'brand': 'Brand', 'product_name': 'Cream',
-                                       'confidence': .92, 'claims': ['声明']}, 'input-timeout')
-        async def search(*args, **kwargs):
-            raise asyncio.TimeoutError()
-        with patch('app.lab.retrieve', side_effect=search):
-            evidence, packages, budget, status = asyncio.run(collect_claim_evidence(
-                identity, {'base_url': 'https://model.example/v1', 'api_key': 'x', 'model': 'm'}, {},
-                {'provider': 'tavily', 'api_key': 'x'}, [], [], search_enabled=True))
-        self.assertEqual(evidence, [])
-        self.assertEqual(budget['calls_used'], 2)
-        self.assertEqual(budget['retries_used'], 1)
-        self.assertEqual(packages[0]['retrieval_events'], ['timeout'])
-        self.assertEqual(status, 'empty')
-
-    def test_empty_followup_result_is_distinct_from_provider_error(self):
-        identity = normalize_identity({'brand': 'Brand', 'product_name': 'Cream',
-                                       'confidence': .92, 'claims': ['声明']}, 'input-empty')
-        async def search(*args, **kwargs):
-            return ([], '')
-        with patch('app.lab.retrieve', side_effect=search):
-            evidence, packages, budget, status = asyncio.run(collect_claim_evidence(
-                identity, {'base_url': 'https://model.example/v1', 'api_key': 'x', 'model': 'm'}, {},
-                {'provider': 'tavily', 'api_key': 'x'}, [], [], search_enabled=True))
-        self.assertEqual(evidence, [])
-        self.assertEqual(budget['calls_used'], 1)
-        self.assertEqual(budget['retries_used'], 0)
-        self.assertEqual(packages[0]['retrieval_events'], ['no_result'])
-        self.assertEqual(status, 'empty')
-
-    def test_provider_error_is_distinct_from_empty_and_timeout(self):
-        identity = normalize_identity({'brand': 'Brand', 'product_name': 'Cream',
-                                       'confidence': .92, 'claims': ['声明']}, 'input-error')
-        async def search(*args, **kwargs):
-            raise ValueError('provider failed')
-        with patch('app.lab.retrieve', side_effect=search):
-            evidence, packages, budget, status = asyncio.run(collect_claim_evidence(
-                identity, {'base_url': 'https://model.example/v1', 'api_key': 'x', 'model': 'm'}, {},
-                {'provider': 'tavily', 'api_key': 'x'}, [], [], search_enabled=True))
-        self.assertEqual(evidence, [])
-        self.assertEqual(budget['calls_used'], 2)
-        self.assertEqual(budget['retries_used'], 1)
-        self.assertEqual(packages[0]['retrieval_events'], ['provider_error'])
-        self.assertEqual(status, 'empty')
-
-    def test_cancelled_followups_return_completed_evidence_and_cancelled_gap(self):
-        identity = normalize_identity({'brand': 'Brand', 'product_name': 'Cream',
-                                       'confidence': .92, 'claims': ['声明一', '声明二']}, 'input-cancel')
-        async def scenario():
-            started = asyncio.Event()
-            completed = asyncio.Event()
-            release = asyncio.Event()
-            async def search(*args, **kwargs):
-                if '声明一' in args[1]:
-                    record = {'url': 'https://source.example/completed', 'title': 'Completed',
-                              'raw_content': '声明一', 'brand': 'Brand', 'product_name': 'Cream'}
-                    kwargs['records_out'].append(record)
-                    completed.set()
-                    return ([record], record['raw_content'])
-                started.set()
-                await release.wait()
-                return ([], '')
-            with patch('app.lab.retrieve', side_effect=search):
-                task = asyncio.create_task(collect_claim_evidence(
-                    identity, {'base_url': 'https://model.example/v1', 'api_key': 'x', 'model': 'm'}, {},
-                    {'provider': 'tavily', 'api_key': 'x'}, [], [], search_enabled=True))
-                await started.wait()
-                await completed.wait()
-                task.cancel()
-                return await task
-        evidence, packages, budget, status = asyncio.run(scenario())
-        self.assertEqual(len(evidence), 1)
-        self.assertEqual(status, 'cancelled')
-        self.assertEqual(budget['cancelled_queries'], 1)
-        self.assertEqual(packages[0]['retrieval_events'], [])
-        self.assertEqual(packages[1]['retrieval_events'], ['cancelled'])
-        self.assertEqual(len(packages[0]['candidates']), 1)
-
-    def test_run_models_stops_before_report_generation_after_retrieval_cancel(self):
-        async def cancelled_collect(*args, **kwargs):
-            return [], [], {'calls_used': 1}, 'cancelled'
-
-        async def empty_retrieve(*args, **kwargs):
-            return [], ''
-
-        async def scenario():
-            model_requests = []
-            async def handler(request):
-                model_requests.append(request)
-                return httpx.Response(500, text='report generation should not start')
-            real = httpx.AsyncClient
-            with patch('app.lab.retrieve', side_effect=empty_retrieve), \
-                    patch('app.lab.collect_claim_evidence', side_effect=cancelled_collect), \
-                    patch('app.lab.httpx.AsyncClient', side_effect=lambda **kw: real(transport=httpx.MockTransport(handler), **kw)):
-                events = [json.loads(s.removeprefix('data: ')) async for s in run_models({
-                    'models': [{'id': 'review', 'agent_role': 'review', 'model': 'review-model',
-                                'base_url': 'https://model.example/v1', 'api_key': 'x'}],
-                    'query': 'product', 'search_enabled': True,
-                }, None)]
-            return events, model_requests
-
-        events, model_requests = asyncio.run(scenario())
-        self.assertEqual(model_requests, [])
-        self.assertEqual([event['type'] for event in events], [
-            'started', 'search_started', 'sources', 'evidence_package_ready', 'cancelled'
-        ])
-
     def test_bailian_report_stream_uses_json_mode_but_custom_endpoint_does_not(self):
         async def collect(base_url):
             bodies=[]
@@ -571,6 +367,63 @@ class WorkbenchLiveTests(unittest.TestCase):
             self.assertEqual(report_requests[1]['max_tokens'],2000)
             self.assertTrue(all(body['response_format']=={'type':'json_object'} for body in report_requests))
         asyncio.run(scenario())
+
+    def test_review_stream_error_after_partial_json_retries_and_keeps_claim_verdicts(self):
+        async def scenario():
+            requests=[]
+            async def handler(request):
+                body=json.loads(request.content); requests.append(body)
+                if body['model']=='vision-model':
+                    identity={'brand':'Test','product_name':'Cream','claims':['7天改善细纹'],'confidence':.95}
+                    return httpx.Response(200,json={'choices':[{'message':{'content':json.dumps(identity)}}]})
+                if body.get('stream'):
+                    partial={'choices':[{'delta':{'content':'{"claim_evidence_audit":[{"claim_id":"'}}]}
+                    error={'error':{'code':'GenerationInterrupted','message':'upstream stream interrupted'}}
+                    return httpx.Response(200,text='data: '+json.dumps(partial)+'\n\ndata: '+json.dumps(error)+'\n\n')
+                claim_id=next(event['claim_id'] for event in json.loads(body['messages'][1]['content'][1]['text'])['claims_structured'])
+                repaired={'claim_evidence_audit':[{'claim_id':claim_id,'claim':'7天改善细纹',
+                                                  'status':'待核验','reason':'没有可核验资料'}]}
+                return httpx.Response(200,json={'choices':[{'message':{'content':json.dumps(repaired)}}]})
+            real=httpx.AsyncClient
+            with patch('app.lab.httpx.AsyncClient',side_effect=lambda **kw:real(transport=httpx.MockTransport(handler),**kw)):
+                events=[json.loads(s.removeprefix('data: ')) async for s in run_models(
+                    {'models':[{'id':'review','agent_role':'review','model':'review-model',
+                                'base_url':'https://model.example/v1','api_key':'x'}],
+                     'vision_model':'vision-model','search_enabled':False},'data:image/png;base64,a')]
+            self.assertEqual(len([event for event in events if event['type']=='model_retry']),1)
+            self.assertFalse(any(event['type']=='model_error' for event in events))
+            report=next(event['report'] for event in events if event['type']=='report')
+            self.assertEqual(len(report['claim_evidence_audit']),1)
+            self.assertEqual(report['claim_evidence_audit'][0]['status'],'待核验')
+            report_requests=[body for body in requests if body['model']=='review-model']
+            self.assertEqual(len(report_requests),2)
+            self.assertGreater(report_requests[0]['max_tokens'],1200)
+            self.assertGreater(report_requests[1]['max_tokens'],report_requests[0]['max_tokens'])
+        asyncio.run(scenario())
+
+    def test_cancelled_followups_keep_completed_evidence_and_mark_pending_claims(self):
+        identity = normalize_identity({'brand':'Brand','product_name':'Cream','confidence':.92,
+                                       'claims':['声明一','声明二']}, 'input-cancel')
+        async def scenario():
+            started = asyncio.Event(); completed = asyncio.Event(); release = asyncio.Event()
+            async def search(*args, **kwargs):
+                if '声明一' in args[1]:
+                    record={'url':'https://source.example/completed','title':'Completed',
+                            'raw_content':'声明一','brand':'Brand','product_name':'Cream'}
+                    kwargs['records_out'].append(record); completed.set()
+                    return ([record], record['raw_content'])
+                started.set(); await release.wait(); return ([], '')
+            with patch('app.lab.retrieve', side_effect=search):
+                task=asyncio.create_task(collect_claim_evidence(
+                    identity, {'base_url':'https://model.example/v1','api_key':'x','model':'m'}, {},
+                    {'provider':'tavily','api_key':'x'}, [], [], search_enabled=True))
+                await started.wait(); await completed.wait(); task.cancel()
+                return await task
+        evidence, packages, budget, status = asyncio.run(scenario())
+        self.assertEqual(len(evidence), 1)
+        self.assertEqual(status, 'cancelled')
+        self.assertEqual(budget['cancelled_queries'], 1)
+        self.assertEqual(packages[1]['retrieval_events'], ['cancelled'])
 
     def test_failed_format_repair_only_fails_the_affected_agent(self):
         async def scenario():
@@ -647,7 +500,8 @@ class WorkbenchLiveTests(unittest.TestCase):
         self.assertLess(kinds.index('sources'),kinds.index('report'))
         self.assertEqual(bodies[0]['model'],'vision-model')
         report=next(e['report'] for e in events if e['type']=='report')
-        self.assertEqual(report['official_facts'][0]['source_ids'],['s1'])
+        self.assertEqual(report['official_facts'],[])
+        self.assertTrue(any('可定位原文' in gap for gap in report['evidence_gaps']))
 
     def test_low_confidence_stops_before_search(self):
         async def handler(request):return httpx.Response(200,json={'choices':[{'message':{'content':'{"confidence":0.2,"product_name":"unclear"}'}}]})

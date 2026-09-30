@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 
 from app.evidence import build_packages, legacy_sources, merge_evidence, normalize_records

@@ -20,7 +20,7 @@ uvicorn app.main:app --reload --port 8000
 ## 结构
 
 - `app/lab.py`：三 Agent 并行识别、声明核验、图片核查、流式检索和结构化报告。
-- `app/evidence.py`：统一检索来源，并按 `claim_id` 建立可追溯的候选证据包。
+- `app/evidence.py`：将 Bailian、Tavily 和 MCP 结果统一成可追溯证据，并按 `claim_id` 建立候选证据包。
 - `app/model_client.py`：DashScope/Qwen 兼容接口调用。
 - `app/mcp_client.py`：Streamable HTTP MCP 调用边界，支持百炼官方/自定义 MCP。
 - `app/orchestrator.py`：产品识别、证据检索、报告生成的事件编排。
@@ -83,13 +83,7 @@ uvicorn app.main:app --reload --port 8000
 }
 ```
 
-OCR 不清晰或字段无法确认时，声明会进入 `partially_parsed` 或 `unparsed`，并在 `uncertainty_reasons` 中说明原因；不会补写确定数值。该契约只负责声明解析和追踪；证据归一化与候选证据关联属于 2B，最终支持判定仍属于 2C。
-
-## 逐声明候选证据（2B PR1）
-
-检索完成后，工作台会复用共享检索结果，为每条 `claims_structured` 生成一个 `claim_evidence_packages` 项。每个候选会记录 `evidence_id`、来源、产品匹配状态、原文相关性、已覆盖/未覆盖条件和关联原因。候选证据不等同于声明已经获得支持。
-
-证据对象保留来源类型、发布主体、可信依据、UGC 标记、获取时间、原文片段、片段定位、内容指纹、产品规格/版本和实验条件。完整正文、提供方摘要和只有 URL 的结果会分别标记；只有实际获取到的正文或片段才作为原文引用。官方标记只作为待验证元数据，不能单独提升可信度；UGC 与官方标记冲突时保守处理。
+OCR 不清晰或字段无法确认时，声明会进入 `partially_parsed` 或 `unparsed`，并在 `uncertainty_reasons` 中说明原因；不会补写确定数值。该契约只负责声明解析和追踪；证据检索与候选证据关联属于 2B，最终支持判定属于 2C。
 
 运行测试（在 `product-agent-demo` 目录内）：
 
@@ -102,8 +96,18 @@ node --test tests/workspace-state.test.mjs
 
 MCP 工具名称和入参由百炼控制台实际开通的服务决定，因此通过页面配置或环境变量提供；没有配置检索服务时页面会保留识别结果并明确显示证据缺口，不会生成虚假的证据。社交媒体截图会被标记为 UGC，文案中的功效和参数只作为待核验声明。官方事实只接受监管来源或检索提供方明确标记为 `official`、`registration`、`authority` 的来源；没有可信等级的普通网页仍会保留为可点击的待核验来源。后续接入产品登记、成分库、淘宝/天猫评论时，为每个来源实现一个 `EvidenceProvider`，返回统一的 `EvidenceItem`，报告只读取结构化证据。下一阶段安排见 [`design/optimization-roadmap.md`](design/optimization-roadmap.md)。
 
-## 有界补充检索（2B PR2）
+## 逐声明证据包（2B）
 
-当共享检索结果无法覆盖某条声明的产品身份、原文、功效指标、时间、人群、数值或背书出处时，工作台会根据缺口生成补充查询。同一查询会合并执行，同一来源会去重，并保留一个来源关联多条声明的关系。
+检索完成后，工作台会先复用共享结果，再按声明缺口执行有界补充检索。每条 `claims_structured` 都会得到一个 `claim_evidence_packages` 项，包含候选 `evidence_id`、产品匹配状态、原文相关性、已覆盖/未覆盖条件和缺口。候选证据不等同于声明已经获得支持，最终判定由后续 2C 消费这些证据包完成。
 
-补查默认每条声明最多 1 次、每次运行最多 4 次、并发最多 2 次、总时限 30 秒、单次调用最多 15 秒；重试计入调用预算。预算消耗、重试、取消、`budget_exhausted`、`no_result`、`timeout` 和 `provider_error` 会写入证据包，并保留已完成的部分结果。补充检索仍只返回候选证据，不负责最终支持程度或风险判断。
+证据对象保留 URL、标题、发布主体、来源类型、可信依据、UGC 标记、获取时间、可用发布时间、原文片段、片段定位、内容指纹、产品规格/版本和实验条件。正文状态明确区分 `body_available`、`summary_only`、`url_only`、`body_unavailable`、`empty`、`timeout` 和 `error`；只有实际获取的正文或片段才会作为原文引用。
+
+补充检索默认每条声明最多 1 次、每次运行最多 4 次、并发最多 2 次、总时限 30 秒、单次调用最多 15 秒。预算消耗、重试、取消、`budget_exhausted`、`no_result`、`timeout` 和 `provider_error` 会写入运行结果，并保留已经完成的部分结果。`/api/lab/run` 继续提供旧的 `sources` 和 `retrieval_material` 字段，同时通过 `evidence_package_ready` 事件和 Agent 结果提供结构化证据包。
+
+## 逐声明裁决（2C）
+
+`review` Agent 的输出会被服务端裁决层重新校验。每个 `claims_structured.claim_id` 都会得到一条 `claim_evidence_audit`，包含状态、原因、证据 ID、支持/反对片段、已覆盖和未覆盖条件、限制与缺口。状态为“有资料支持”时，证据必须匹配同一产品及适用版本、具备可定位原文并覆盖关键条件；功效声明还需要适用的研究或检测材料。只有品牌自述、UGC、规格页、备案或成分研究不能直接证明成品功效。
+
+“部分支持”表示只覆盖子命题或带有限制；“待核验”涵盖无来源、产品不匹配、正文不可得、检索失败和预算耗尽；“存在冲突”只用于同一产品范围内的明确反证或实质来源冲突。摘要、事实卡、工作台展示和导出都读取已校验结果，其他 Agent 的自由文本不能覆盖 `review` 裁决。完整矩阵和固定样例见 [`design/claim-review-decision-matrix.md`](design/claim-review-decision-matrix.md)。
+
+补充检索有明确预算：每条声明最多 1 次、每次运行最多 4 次、并发最多 2 次、总时限 30 秒；重试、超时、取消和预算耗尽都会写入证据包。客户端断开时保留已完成的证据，并将未完成查询标记为 `cancelled`，不会继续启动 Agent 报告生成。
