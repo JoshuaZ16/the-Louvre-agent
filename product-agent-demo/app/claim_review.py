@@ -31,19 +31,33 @@ def condition_text(value):
     return text(value)
 
 
-def usable_source(item):
-    """Source metadata is a prerequisite, not an independent verification."""
+def source_tier(item):
+    """Return the evidentiary tier without turning metadata into a verdict.
+
+    Search-provider citations often have useful answer text but no publisher or
+    source label. They may support a bounded, summary-level result; they cannot
+    satisfy the independent/body requirements for a full efficacy verdict.
+    """
     host = urlparse(text(item.get("url"))).hostname or ""
     if item.get("is_ugc") or item.get("source_type") == "ugc":
-        return False
+        return ""
     basis = items(item.get("trust_basis"))
     if "ugc_official_conflict" in basis:
-        return False
+        return ""
     if item.get("source_type") == "registration":
-        return host.endswith((".gov.cn", ".nifdc.org.cn")) and "regulatory_domain" in basis
+        return "independent" if host.endswith((".gov.cn", ".nifdc.org.cn")) and "regulatory_domain" in basis else "context"
     if item.get("source_type") == "brand":
-        return bool(text(item.get("publisher")) and item.get("provider_marked_official"))
-    return item.get("source_type") in {"research", "testing"}
+        return "brand" if text(item.get("publisher")) and item.get("provider_marked_official") else "context"
+    if item.get("source_type") in {"research", "testing"}:
+        return "independent"
+    if item.get("source_type") in {"platform", "other"}:
+        return "context"
+    return ""
+
+
+def usable_source(item):
+    """Compatibility boolean for callers that only need source eligibility."""
+    return bool(source_tier(item))
 
 
 def product_matches(claim, item):
@@ -162,7 +176,8 @@ def adjudicate_claims(claims, evidence_items, claim_packages, model_audits, retr
                 gaps.append("unlocatable_quote")
                 invalid = True
                 continue
-            if (not usable_source(item) or not product_matches(claim, item)
+            tier = source_tier(item)
+            if (not tier or not product_matches(claim, item)
                     or text(link.get("product_match")).lower() not in {"matched", "match", "相符"}
                     or text(link.get("content_relevance")).lower() not in {"relevant", "直接相关", "matched"}):
                 gaps.append("source_or_product_inapplicable")
@@ -203,13 +218,15 @@ def adjudicate_claims(claims, evidence_items, claim_packages, model_audits, retr
                 support.append(view)
                 covered.update(matched)
                 if relation == "supports" and not absent and item.get("availability") == "body_available":
-                    if not is_effect or (item.get("source_type") in {"research", "testing"}
-                                         and scope not in {"ingredient", "ingredient_study", "成分研究", "registration", "备案"}):
+                    if tier in {"independent", "brand"} and (not is_effect or (item.get("source_type") in {"research", "testing"}
+                                         and scope not in {"ingredient", "ingredient_study", "成分研究", "registration", "备案"})):
                         full = True
                 if item.get("source_type") == "brand" and is_effect:
                     limitations.append("品牌页面如此声称，不等同于独立功效验证")
                 if item.get("availability") != "body_available":
                     limitations.append("只有提供方原文摘要片段，未获取完整正文")
+                if tier == "context":
+                    limitations.append("来源类型或发布主体未充分确认，仅作为背景或摘要级材料")
                 if is_effect and item.get("source_type") in {"research", "testing"} and scope not in {"finished_product", "product", "成品研究"}:
                     limitations.append("尚未确认研究适用于具体成品")
         if claim.get("parse_status") in {"unparsed", "partially_parsed", "budget_excluded"}:

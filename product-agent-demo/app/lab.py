@@ -383,13 +383,19 @@ def sources_from(records):
     for r in records:
         if not isinstance(r, dict): continue
         url = r.get("url", "")
-        if not http_url(url) or url in seen: continue
-        seen.add(url)
+        if not http_url(url): continue
         host = urlparse(url).hostname or ""
         source_level = str(r.get("source_level") or r.get("kind") or "").lower()
         trusted = not bool(r.get("is_ugc")) and (bool(r.get("is_official")) or host.endswith(".gov.cn") or host.endswith(".nifdc.org.cn") or source_level in {"official", "registration", "authority", "官方来源", "监管公开来源"})
+        snippet = str(r.get("snippet") or r.get("content") or "")[:2500]
+        if url in seen:
+            existing = next((source for source in sources if source["url"] == url), None)
+            if existing is not None and not existing.get("snippet") and snippet:
+                existing["snippet"] = snippet
+            continue
+        seen.add(url)
         sources.append({"source_id": f"s{len(sources)+1}", "title": r.get("title") or host,
-            "url": url, "domain": host, "snippet": str(r.get("snippet") or r.get("content") or "")[:2500],
+            "url": url, "domain": host, "snippet": snippet,
             "kind": source_level or ("监管公开来源" if trusted else "待核验来源"), "trusted": trusted,
             "is_ugc": bool(r.get("is_ugc")), "trust_basis": [f"provider_label:{source_level}"] if source_level else []})
     return sources[:12]
@@ -671,10 +677,17 @@ async def retrieve(raw, query, mcp, search=None, progress=None, records_out=None
                     records.append({"url": source} if isinstance(source, str) else source)
             if item.get("type") == "message":
                 for part in item.get("content", []):
-                    if part.get("text"): content.append(part["text"])
+                    message_text = part.get("text") or ""
+                    if message_text: content.append(message_text)
                     for annotation in part.get("annotations", []):
                         citation = annotation.get("url_citation", annotation)
-                        if citation.get("url"): records.append(citation)
+                        if citation.get("url"):
+                            # Responses API citations commonly carry only a URL;
+                            # retain the cited answer as summary-level evidence so
+                            # 2C can produce partial support without treating it as
+                            # retrievable source正文.
+                            records.append({**citation, "snippet": message_text,
+                                            "model_summary": message_text})
         if records_out is not None: records_out.extend(records)
         return sources_from(records), "\n".join(content)[:10000]
 

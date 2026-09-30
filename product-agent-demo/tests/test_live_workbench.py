@@ -458,13 +458,14 @@ class WorkbenchLiveTests(unittest.TestCase):
         requests=[]
         async def handler(req):
             requests.append(req)
-            return httpx.Response(200,json={'output':[{'type':'web_search_call','action':{'sources':[{'url':'https://brand.example/a','title':'Official page'}]}},{'type':'message','content':[{'type':'output_text','text':'Retrieved material','annotations':[]}]}]})
+            return httpx.Response(200,json={'output':[{'type':'web_search_call','action':{'sources':[{'url':'https://brand.example/a','title':'Official page'}]}},{'type':'message','content':[{'type':'output_text','text':'Retrieved material','annotations':[{'url_citation':{'url':'https://brand.example/a','title':'Official page'}}]}]}]})
         real=httpx.AsyncClient
         with patch('app.lab.httpx.AsyncClient',side_effect=lambda **kw:real(transport=httpx.MockTransport(handler),**kw)):
             sources,_=asyncio.run(retrieve({'base_url':'https://workspace.cn-beijing.maas.aliyuncs.com/compatible-mode/v1','api_key':'x','model':'qwen3.8-max'},'cream',{}, {'provider':'bailian','model':'qwen3.8-max'}))
         self.assertTrue(str(requests[0].url).endswith('/responses'))
         self.assertEqual(json.loads(requests[0].content)['tools'],[{'type':'web_search'}])
         self.assertEqual(sources[0]['url'],'https://brand.example/a')
+        self.assertIn('Retrieved material', [source['snippet'] for source in sources])
 
     def test_tavily_search_returns_clickable_deduplicated_sources(self):
         seen=[]

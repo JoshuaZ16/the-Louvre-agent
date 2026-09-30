@@ -82,6 +82,14 @@ class ClaimReviewTests(unittest.TestCase):
         self.assertEqual(ugc["status"], "待核验")
         self.assertTrue(ugc["limitations"])
 
+    def test_summary_citation_can_be_partial_but_never_full(self):
+        c = claim()
+        e = evidence("other", "Brand Cream 7天祛斑摘要")
+        e["availability"] = "summary_only"
+        result = self.adjudicate(c, e, package(), audit(c, e))
+        self.assertEqual(result["status"], "部分支持")
+        self.assertIn("摘要级材料", "；".join(result["limitations"]))
+
     def test_unknown_ids_and_missing_claims_are_conservative(self):
         c = claim()
         result = adjudicate_claims([c], [evidence()], [package(candidates=[{"evidence_id": "missing", "product_match": "matched"}])],
