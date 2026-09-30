@@ -5,6 +5,7 @@ from unittest.mock import patch
 import httpx
 from app.lab import (ReportFormatError, collect_claim_evidence, error_text, normalize_identity, parse_json,
                      retrieve, run_models, sources_from, stable_input_id, validate_report)
+from app.evidence import build_packages, normalize_records
 
 class WorkbenchLiveTests(unittest.TestCase):
     def test_upstream_status_errors_explain_key_and_quota_failures(self):
@@ -485,6 +486,25 @@ class WorkbenchLiveTests(unittest.TestCase):
         self.assertEqual(sources[0]['snippet'],'Ingredients from source')
         self.assertEqual(seen[0].headers['authorization'],'Bearer search-key')
         self.assertEqual(json.loads(seen[0].content)['query'],'test product')
+
+    def test_tavily_raw_content_enters_body_evidence_for_claim_packages(self):
+        async def handler(request):
+            return httpx.Response(200,json={'results':[{
+                'title':'Brand product','url':'https://brand.example/product',
+                'content':'Brand Cream 7天修护','raw_content':'Brand Cream 7天修护，正文说明。'
+            }]})
+        real=httpx.AsyncClient
+        records=[]
+        def client(**kwargs):return real(transport=httpx.MockTransport(handler),**kwargs)
+        with patch('app.lab.httpx.AsyncClient',side_effect=client):
+            asyncio.run(retrieve({'base_url':'https://model.example/v1','api_key':'model-key'},'test product',{},
+                                 {'provider':'tavily','api_key':'search-key'},records_out=records))
+        evidence=normalize_records(records,'tavily')
+        self.assertEqual(evidence[0]['availability'],'body_available')
+        claim=normalize_identity({'brand':'Brand','product_name':'Cream','claims':['7天修护'],'confidence':.9},'input-tavily')['claims_structured'][0]
+        packages=build_packages([claim],evidence,'input-tavily')
+        self.assertEqual(packages[0]['candidates'][0]['product_match'],'matched')
+        self.assertEqual(packages[0]['candidates'][0]['content_relevance'],'relevant')
 
     def test_configured_vision_model_then_search_then_grounded_report(self):
         bodies=[]
