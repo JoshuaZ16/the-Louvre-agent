@@ -2,6 +2,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+from html import unescape
 import json
 import os
 import re
@@ -400,6 +401,47 @@ def sources_from(records):
             "is_ugc": bool(r.get("is_ugc")), "trust_basis": [f"provider_label:{source_level}"] if source_level else []})
     return sources[:12]
 
+
+def _page_text(response):
+    """Extract bounded readable text from an HTML response for evidence."""
+    content_type = response.headers.get("content-type", "").lower()
+    if "text/html" not in content_type and "text/plain" not in content_type:
+        return ""
+    value = response.text
+    if "text/html" in content_type:
+        value = re.sub(r"(?is)<(script|style|noscript|svg).*?>.*?</\1>", " ", value)
+        value = re.sub(r"(?s)<[^>]+>", " ", value)
+    return re.sub(r"\s+", " ", unescape(value)).strip()[:12000]
+
+
+async def _enrich_page_records(client, records):
+    """Fetch missing page bodies with a small bounded concurrency window."""
+    unique = {}
+    for record in records:
+        if not isinstance(record, dict) or not http_url(record.get("url")):
+            continue
+        if record.get("raw_content") or record.get("body") or record.get("page_content"):
+            continue
+        unique.setdefault(record["url"], record)
+    semaphore = asyncio.Semaphore(3)
+
+    async def fetch(record):
+        async with semaphore:
+            try:
+                response = await client.get(record["url"], follow_redirects=True,
+                                            timeout=10,
+                                            headers={"User-Agent": "Louvre-Agent/2C evidence fetch"})
+                if response.status_code >= 400:
+                    return
+                body = _page_text(response)
+                if body:
+                    record["raw_content"] = body
+                    record["content_source"] = "fetched_page"
+            except Exception:
+                return
+
+    await asyncio.gather(*(fetch(record) for record in unique.values()))
+
 def validate_report(report, sources, identity=None, evidence_items=None, claim_packages=None,
                     retrieval_status="ok", failure=None, agent_role="review"):
     if not isinstance(report, dict):
@@ -688,6 +730,8 @@ async def retrieve(raw, query, mcp, search=None, progress=None, records_out=None
                             # retrievable source正文.
                             records.append({**citation, "snippet": message_text,
                                             "model_summary": message_text})
+        await notify("正在打开检索到的网页并读取正文")
+        await _enrich_page_records(client, records)
         if records_out is not None: records_out.extend(records)
         return sources_from(records), "\n".join(content)[:10000]
 
