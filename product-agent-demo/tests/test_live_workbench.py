@@ -368,6 +368,39 @@ class WorkbenchLiveTests(unittest.TestCase):
             self.assertTrue(all(body['response_format']=={'type':'json_object'} for body in report_requests))
         asyncio.run(scenario())
 
+    def test_review_stream_error_after_partial_json_retries_and_keeps_claim_verdicts(self):
+        async def scenario():
+            requests=[]
+            async def handler(request):
+                body=json.loads(request.content); requests.append(body)
+                if body['model']=='vision-model':
+                    identity={'brand':'Test','product_name':'Cream','claims':['7天改善细纹'],'confidence':.95}
+                    return httpx.Response(200,json={'choices':[{'message':{'content':json.dumps(identity)}}]})
+                if body.get('stream'):
+                    partial={'choices':[{'delta':{'content':'{"claim_evidence_audit":[{"claim_id":"'}}]}
+                    error={'error':{'code':'GenerationInterrupted','message':'upstream stream interrupted'}}
+                    return httpx.Response(200,text='data: '+json.dumps(partial)+'\n\ndata: '+json.dumps(error)+'\n\n')
+                claim_id=next(event['claim_id'] for event in json.loads(body['messages'][1]['content'][1]['text'])['claims_structured'])
+                repaired={'claim_evidence_audit':[{'claim_id':claim_id,'claim':'7天改善细纹',
+                                                  'status':'待核验','reason':'没有可核验资料'}]}
+                return httpx.Response(200,json={'choices':[{'message':{'content':json.dumps(repaired)}}]})
+            real=httpx.AsyncClient
+            with patch('app.lab.httpx.AsyncClient',side_effect=lambda **kw:real(transport=httpx.MockTransport(handler),**kw)):
+                events=[json.loads(s.removeprefix('data: ')) async for s in run_models(
+                    {'models':[{'id':'review','agent_role':'review','model':'review-model',
+                                'base_url':'https://model.example/v1','api_key':'x'}],
+                     'vision_model':'vision-model','search_enabled':False},'data:image/png;base64,a')]
+            self.assertEqual(len([event for event in events if event['type']=='model_retry']),1)
+            self.assertFalse(any(event['type']=='model_error' for event in events))
+            report=next(event['report'] for event in events if event['type']=='report')
+            self.assertEqual(len(report['claim_evidence_audit']),1)
+            self.assertEqual(report['claim_evidence_audit'][0]['status'],'待核验')
+            report_requests=[body for body in requests if body['model']=='review-model']
+            self.assertEqual(len(report_requests),2)
+            self.assertGreater(report_requests[0]['max_tokens'],1200)
+            self.assertGreater(report_requests[1]['max_tokens'],report_requests[0]['max_tokens'])
+        asyncio.run(scenario())
+
     def test_failed_format_repair_only_fails_the_affected_agent(self):
         async def scenario():
             requests=[]

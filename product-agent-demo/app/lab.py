@@ -38,7 +38,7 @@ REPORT_PROMPT = """基于当前这一张图片、产品识别和检索材料生�
 "official_facts":[{"fact":"","source_ids":[]}],
 "claim_evidence_audit":[{"claim_id":"","claim":"","status":"待核验","reason":"","source_ids":[],"evidence_ids":[],"supporting_evidence":[{"evidence_id":"","source_id":"","quote":"","supported_text":"","reason":"","relation":"supports","condition_assessments":{}}],"contradicting_evidence":[{"evidence_id":"","source_id":"","quote":"","supported_text":"","reason":"","relation":"contradicts","comparable":false}],"limitations":[]}],"evidence_gaps":[]}
 status 可取：有资料支持、部分支持、待核验、存在冲突。对 claims_structured 逐条核验时必须沿用输入 claim_id；未查到不等于虚假。supporting_evidence 和 contradicting_evidence 中的 quote 必须逐字来自对应 evidence_items 的原文片段，并填写 supported_text、reason、relation；每个条件在 condition_assessments 中填写 matched/unmatched 和可定位 quote。模型只能提出候选，最终状态由程序复核。"""
-REPAIR_REPORT_PROMPT = """输出预算：必须优先返回完整 JSON，而不是穷尽材料。摘要不超过60字；claims 最多6条、每条不超过60字；official_facts 最多3条、每条不超过100字；claim_evidence_audit 最多5条，其中 claim 不超过80字、reason 不超过120字；evidence_gaps 和 image_observations 各最多4条、每条不超过80字。声明核验中的支持/反对证据必须保留 evidence_id、source_id、原文 quote、supported_text、reason、relation 和 condition_assessments。信息不确定或篇幅不足时直接省略低优先级条目，数组可为空。"""
+REPAIR_REPORT_PROMPT = """输出预算：必须优先返回完整 JSON，而不是穷尽材料。摘要不超过60字；claims 最多6条、每条不超过60字；official_facts 最多3条、每条不超过100字；claim_evidence_audit 最多8条，每个输入 claim_id 最多一条，其中 claim 不超过80字、reason 不超过80字；每条声明最多一条支持证据和一条反对证据，quote 不超过60字；evidence_gaps 和 image_observations 各最多4条、每条不超过80字。证据条目保留 evidence_id、source_id、原文 quote、supported_text、reason、relation 和 condition_assessments。证据无法确认时使用空数组；不要重复填充字段或引文。"""
 SKILL_DEFAULT = "优先产品基础事实、官方功效依据和使用方法。保留实验样本量、时间和指标。只分析当前图片，不批量处理多篇种草文案。"
 AGENT_ROLES = {
     "facts": "你是产品事实智能体。核对产品身份、规格、成分、制造商与用法。区分包装可见内容和网页来源支持的事实。",
@@ -875,6 +875,8 @@ async def run_models(options, image):
                     if role in AGENT_ROLES:
                         system += "\n" + AGENT_ROLES[role]
                         system += "\n额外可输出 image_observations 数组，描述图片可见事实；不要编造图片区域或来源。"
+                    if role == "review":
+                        system += "\n逐声明输出务必紧凑：每个 claim_id 最多一条结果，每条最多一条支持证据和一条反对证据；quote 最多60字。无法确认的证据使用空数组，勿重复引文或字段。"
                     if raw.get("instructions"):
                         system += "\n本智能体补充要求：" + str(raw["instructions"])
                     if options.get("skill_enabled",True): system+="\n工作约束：\n"+options.get("skill",SKILL_DEFAULT)
@@ -898,8 +900,9 @@ async def run_models(options, image):
                     user_content = [{"type":"text","text":task_content}]
                     if image:
                         user_content.insert(0, {"type":"image_url","image_url":{"url":image}})
-                    def report_body(stream, prompt=system, max_tokens=1200):
-                        body={"model":mc.model,"temperature":mc.temperature,"max_tokens":max_tokens,"stream":stream,
+                    def report_body(stream, prompt=system, max_tokens=None):
+                        output_tokens = max_tokens if max_tokens is not None else (3000 if role == "review" else 1200)
+                        body={"model":mc.model,"temperature":mc.temperature,"max_tokens":output_tokens,"stream":stream,
                             "messages":[{"role":"system","content":prompt},{"role":"user","content":user_content}]}
                         if is_bailian_endpoint(mc.base_url):
                             body["response_format"] = {"type":"json_object"}
@@ -909,33 +912,41 @@ async def run_models(options, image):
                     await put("model_started",model_id=mid,model=mc.model,agent_name=raw.get("name", mid))
                     stream_completed = False
                     async with httpx.AsyncClient(timeout=mc.timeout_seconds) as client:
-                        async with client.stream("POST",mc.chat_url,headers={"Authorization":f"Bearer {mc.api_key}"},json=body) as r:
-                            r.raise_for_status()
-                            async for line in r.aiter_lines():
-                                if not line.startswith("data:"): continue
-                                fragment=line[5:].strip()
-                                if fragment=="[DONE]":
-                                    stream_completed = True
-                                    break
-                                chunk=json.loads(fragment)
-                                request_id = chunk.get("id") or request_id
-                                if chunk.get("error"): raise ValueError("模型流返回错误")
-                                choices=chunk.get("choices",[])
-                                delta=choices[0].get("delta",{}).get("content") if choices else None
-                                if isinstance(delta,str) and delta:
-                                    if first_token is None: first_token=round((time.monotonic()-begin)*1000)
-                                    text+=delta
-                                    await put("token",model_id=mid,text=delta)
-                        if not stream_completed:
-                            raise ValueError("模型流未返回完成标记")
                         try:
+                            async with client.stream("POST",mc.chat_url,headers={"Authorization":f"Bearer {mc.api_key}"},json=body) as r:
+                                r.raise_for_status()
+                                async for line in r.aiter_lines():
+                                    if not line.startswith("data:"): continue
+                                    fragment=line[5:].strip()
+                                    if fragment=="[DONE]":
+                                        stream_completed = True
+                                        break
+                                    try:
+                                        chunk=json.loads(fragment)
+                                    except json.JSONDecodeError as exc:
+                                        raise ReportFormatError("模型流事件不是有效 JSON") from exc
+                                    request_id = chunk.get("id") or request_id
+                                    if chunk.get("error"):
+                                        upstream_error = chunk["error"]
+                                        code = upstream_error.get("code") if isinstance(upstream_error, dict) else ""
+                                        safe_code = re.sub(r"[^A-Za-z0-9_.-]", "", str(code))[:60]
+                                        raise ReportFormatError("模型流返回错误" + (f"（{safe_code}）" if safe_code else ""))
+                                    choices=chunk.get("choices",[])
+                                    delta=choices[0].get("delta",{}).get("content") if choices else None
+                                    if isinstance(delta,str) and delta:
+                                        if first_token is None: first_token=round((time.monotonic()-begin)*1000)
+                                        text+=delta
+                                        await put("token",model_id=mid,text=delta)
+                            if not stream_completed:
+                                raise ReportFormatError("模型流未返回完成标记")
                             parsed=validate_report(parse_json(text),sources,identity,evidence_items,claim_packages,
                                                    retrieval_status=retrieval_status, agent_role=role)
                         except ReportFormatError as initial_error:
-                            await put("model_retry",model_id=mid,message="报告格式异常，正在自动修复")
+                            await put("model_retry",model_id=mid,message="模型流中断或报告格式异常，正在自动修复")
                             repair_prompt = system + "\n修复要求：上一份输出无法解析。现在只返回一个完整、有效的 JSON 对象；不要 Markdown、说明文字、前后缀或第二个 JSON。\n" + REPAIR_REPORT_PROMPT
                             try:
-                                response=await client.post(mc.chat_url,headers={"Authorization":f"Bearer {mc.api_key}"},json=report_body(False, repair_prompt, 2000))
+                                response=await client.post(mc.chat_url,headers={"Authorization":f"Bearer {mc.api_key}"},
+                                                           json=report_body(False, repair_prompt, 3600 if role == "review" else 2000))
                                 response.raise_for_status()
                                 payload=response.json()
                                 content=payload.get("choices", [{}])[0].get("message", {}).get("content")
